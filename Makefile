@@ -1,33 +1,44 @@
-.PHONY: install run repl test lint fmt typecheck eval docker-build docker-run check
+# Thin shim over tasks.py so `make <target>` and `python tasks.py <target>` behave
+# identically. All logic lives in tasks.py -- keep it that way.
+PY ?= python3
+
+.PHONY: install run repl doctor lint fmt typecheck test eval check docker-build docker-run clean
 
 install:
-	uv sync --extra dev
+	$(PY) tasks.py install
 
 run:
-	uv run agency run "$(P)"
+	$(PY) tasks.py run "$(P)"
 
 repl:
-	uv run agency repl
+	$(PY) tasks.py repl
 
-test:
-	uv run pytest -q
+doctor:
+	$(PY) tasks.py doctor
 
 lint:
-	uv run ruff check .
+	$(PY) tasks.py lint
 
 fmt:
-	uv run ruff format . && uv run ruff check --fix .
+	$(PY) tasks.py fmt
 
 typecheck:
-	uv run mypy src evals
+	$(PY) tasks.py typecheck
+
+test:
+	$(PY) tasks.py test
 
 eval:
-	uv run python -m evals.run_eval
+	$(PY) tasks.py eval
 
-check: lint typecheck test
+check:
+	$(PY) tasks.py check
 
 docker-build:
-	docker build -t agency:latest .
+	$(PY) tasks.py docker-build
 
 docker-run:
-	docker compose run --rm agent run "$(P)"
+	$(PY) tasks.py docker-run "$(P)"
+
+clean:
+	$(PY) tasks.py clean

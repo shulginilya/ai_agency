@@ -8,12 +8,46 @@ It gives you the four things a toy script doesn't: **custom tools**, **guardrail
 
 ## Quick start
 
-```bash
-cp .env.example .env       # add ANTHROPIC_API_KEY (or use an existing Claude Code login)
-make install
-make run P="What files are in the workspace? Summarise them."
-make repl                  # interactive multi-turn session
+Windows (PowerShell):
+
+```powershell
+copy .env.example .env      # add ANTHROPIC_API_KEY (or use an existing Claude Code login)
+python tasks.py install
+python tasks.py run "What files are in the workspace? Summarise them."
+python tasks.py repl        # interactive multi-turn session
 ```
+
+macOS / Linux — same thing, either form works:
+
+```bash
+cp .env.example .env
+python3 tasks.py install    # or: make install
+python3 tasks.py run "What files are in the workspace? Summarise them."
+python3 tasks.py repl
+```
+
+## Commands
+
+`tasks.py` is a stdlib-only task runner, so it works everywhere without GNU Make. It
+shells out through `uv` when `uv` is on PATH and falls back to the active environment
+otherwise. The `Makefile` is a thin shim that forwards to the same file — add new
+commands to `tasks.py`, never to both.
+
+| Task | Does |
+|---|---|
+| `install` | Sync deps with dev extras (`uv sync`, or `pip install -e ".[dev]"`) |
+| `run "…"` | One-shot prompt |
+| `repl` | Interactive session, context retained across turns |
+| `doctor` | Print resolved config, workspace path, MCP status |
+| `lint` / `fmt` | ruff check / ruff format + autofix |
+| `typecheck` | mypy over `src` and `evals` |
+| `test` | pytest |
+| `check` | lint + typecheck + test — the pre-commit gate |
+| `eval` | Run the eval suite (hits the API, costs money) |
+| `docker-build` / `docker-run` | Build and run the sandbox container |
+| `clean` | Drop caches and build artefacts |
+
+Run `python tasks.py` with no arguments to see the same list.
 
 ## What's in the box
 
@@ -70,4 +104,4 @@ assertions:
     value: 0.25
 ```
 
-Then `make eval`.
+Then `python tasks.py eval`.

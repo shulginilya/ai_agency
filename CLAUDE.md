@@ -39,8 +39,15 @@ agent harnesses become unreproducible.
 
 ## Commands
 
-    make install     # uv sync
-    make run P="..." # one-shot
-    make repl        # interactive session
-    make check       # lint + typecheck + test
-    make eval        # run the eval suite
+`tasks.py` is the single source of truth. The Makefile is a shim that forwards to it --
+add new commands to `tasks.py`, not to the Makefile, or the two will drift.
+
+    python tasks.py install     # sync deps (uv if present, else pip -e ".[dev]")
+    python tasks.py run "..."   # one-shot
+    python tasks.py repl        # interactive session
+    python tasks.py doctor      # print resolved config
+    python tasks.py check       # lint + typecheck + test
+    python tasks.py eval        # run the eval suite (costs money)
+    python tasks.py clean       # drop caches
+
+On Windows use `python`; on macOS/Linux `python3` or `make <target>`.
