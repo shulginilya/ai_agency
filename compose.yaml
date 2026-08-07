@@ -1,0 +1,27 @@
+services:
+  agent:
+    build: .
+    image: agency:latest
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}
+      AGENCY_PROFILE: ${AGENCY_PROFILE:-sandboxed}
+      AGENCY_MODEL: ${AGENCY_MODEL:-claude-sonnet-5}
+      AGENCY_MAX_BUDGET_USD: ${AGENCY_MAX_BUDGET_USD:-2.00}
+    volumes:
+      # Only the workspace is writable. Source is read-only so the agent cannot
+      # rewrite its own guardrails.
+      - ./workspace:/app/workspace:rw
+      - ./runs:/app/runs:rw
+      - ./src:/app/src:ro
+    # Defence in depth: no new privileges, dropped caps, bounded resources.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: false
+    tmpfs:
+      - /tmp
+    mem_limit: 2g
+    pids_limit: 512
+    stdin_open: true
+    tty: true

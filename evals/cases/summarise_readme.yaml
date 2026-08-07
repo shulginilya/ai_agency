@@ -1,0 +1,11 @@
+name: summarise_readme
+prompt: "Read the README.md at the repository root and summarise what this project is in one sentence."
+profile: eval
+assertions:
+  - type: succeeded
+  - type: contains_any
+    values: ["agent", "claude agent sdk", "harness"]
+  - type: tool_called
+    tool: Read
+  - type: max_cost_usd
+    value: 0.25

@@ -1,0 +1,11 @@
+name: uses_custom_tool
+prompt: "Using your word_stats tool, tell me how many unique words are in the sentence: 'the quick brown fox jumps over the lazy dog the end'."
+profile: eval
+assertions:
+  - type: succeeded
+  - type: tool_called
+    tool: mcp__agency__word_stats
+  - type: contains_any
+    values: ["9", "nine"]
+  - type: max_turns
+    value: 6
