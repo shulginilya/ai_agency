@@ -52,4 +52,8 @@ mypy_path = "src"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-pythonpath = ["src"]
+# "." (repo root) is required so `evals` is importable -- test_scorers.py imports
+# evals.scorers. Without it, tests only pass by accident when invoked via
+# `python -m pytest` (which happens to prepend cwd to sys.path); running the
+# `pytest` console script directly fails collection with ModuleNotFoundError.
+pythonpath = ["src", "."]

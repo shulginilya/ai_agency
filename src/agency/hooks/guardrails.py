@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 import shlex
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from agency.obs.cost import RunRecord, ToolCall
@@ -91,11 +91,17 @@ def make_guardrail_hook(workspace: Path, record: RunRecord | None = None) -> Any
                 tokens = []
             for i, token in enumerate(tokens):
                 if token == "cd" and i + 1 < len(tokens):
-                    target = Path(tokens[i + 1])
-                    if target.is_absolute() and not _is_within(target, workspace):
-                        return blocked(
-                            f"Blocked by guardrail: cd outside the workspace ({target})."
-                        )
+                    raw_target = tokens[i + 1]
+                    # Bash commands are always POSIX syntax, regardless of the host OS
+                    # this hook happens to run on -- PurePosixPath.is_absolute() gives a
+                    # platform-independent answer, unlike Path.is_absolute(), which on
+                    # Windows returns False for "/etc" (no drive letter).
+                    if PurePosixPath(raw_target).is_absolute():
+                        target = Path(raw_target)
+                        if not _is_within(target, workspace):
+                            return blocked(
+                                f"Blocked by guardrail: cd outside the workspace ({target})."
+                            )
 
         if tool in FILE_TOOLS:
             raw = args.get("file_path") or args.get("notebook_path") or ""
@@ -105,7 +111,15 @@ def make_guardrail_hook(workspace: Path, record: RunRecord | None = None) -> Any
                     return blocked(
                         f"Blocked by guardrail: {path.name} may hold credentials."
                     )
-                if tool != "Read" and path.is_absolute() and not _is_within(path, workspace):
+                # Same platform pitfall as the cd check above: file_path args describe
+                # paths in the harness's runtime (POSIX, per Dockerfile/compose.yaml),
+                # so use PurePosixPath for the absoluteness test regardless of the host
+                # OS pytest happens to run on.
+                if (
+                    tool != "Read"
+                    and PurePosixPath(str(raw)).is_absolute()
+                    and not _is_within(path, workspace)
+                ):
                     return blocked(
                         f"Blocked by guardrail: write outside the workspace ({path})."
                     )
