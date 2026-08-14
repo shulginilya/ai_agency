@@ -15,12 +15,14 @@ from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk.types import HookEvent, PermissionMode
 
 from agency.agents.definitions import AGENTS
+from agency.agents.team import MANAGER_PROMPT, TEAM
 from agency.config import Profile, Settings, get_settings
 from agency.hooks.audit import (
     make_failure_audit_hook,
     make_post_audit_hook,
     make_pre_audit_hook,
 )
+from agency.hooks.delegation import make_subagent_start_hook, make_subagent_stop_hook
 from agency.hooks.guardrails import make_guardrail_hook
 from agency.obs.cost import RunRecord
 from agency.obs.logging import get_logger
@@ -43,11 +45,28 @@ Operating rules:
 
 # Built-in tools, per profile. Anything not listed falls through to permission_mode and
 # then to can_use_tool -- listing here only means "auto-approve", not "restrict to".
-READ_ONLY_TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "Task"]
+#
+# "Task" AND "Agent": the subagent-invocation tool was renamed Task -> Agent in Claude
+# Code v2.1.63. Current SDKs emit "Agent" in tool_use blocks but still report "Task" in
+# the system:init tool list. Listing only one of them means delegation calls fall
+# through to can_use_tool and the manager stalls on a permission prompt -- which looks
+# exactly like "the model refuses to delegate".
+READ_ONLY_TOOLS = [
+    "Read", "Glob", "Grep", "WebSearch", "WebFetch", "TodoWrite", "Task", "Agent",
+]
 WRITE_TOOLS = ["Write", "Edit", "NotebookEdit"]
 EXEC_TOOLS = ["Bash"]
 
 ALWAYS_DISALLOWED = ["KillShell"]
+
+# Caps on the agent tree. Without these, one prompt can fan out into an unbounded number
+# of workers: Claude decides when to spawn, and a worker can spawn workers of its own.
+# Depth 1 = your workers cannot spawn their own subagents. Enforced by the CLI, not by
+# prompt wording, so they hold regardless of what the model decides to do.
+SUBAGENT_LIMITS = {
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1",
+    "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "4",
+}
 
 
 def _load_mcp_servers(root: Path) -> dict[str, Any]:
@@ -70,10 +89,16 @@ def build_options(
     record: RunRecord | None = None,
     settings: Settings | None = None,
     project_root: Path | None = None,
+    team: bool = False,
 ) -> ClaudeAgentOptions:
     """Build the options for a run.
 
     `record` is threaded into the hooks so the tool trace lands on the run record.
+
+    `team=True` switches the main thread from solo agent to manager: it swaps in
+    MANAGER_PROMPT and adds the TEAM workers. Everything else -- profile, guardrails,
+    budget -- is unchanged, which is the point. Orchestration and policy are orthogonal;
+    a manager in `sandboxed` is still sandboxed, and so is every worker it spawns.
     """
     settings = settings or get_settings()
     profile = profile or settings.profile
@@ -103,10 +128,16 @@ def build_options(
         hooks["PreToolUse"].append(HookMatcher(hooks=[make_pre_audit_hook(record)]))
         hooks["PostToolUse"] = [HookMatcher(hooks=[make_post_audit_hook(record)])]
         hooks["PostToolUseFailure"] = [HookMatcher(hooks=[make_failure_audit_hook(record)])]
+        # Subagent lifecycle. PostToolUse sees the Agent *call*; only these see which
+        # worker actually ran and for how long. Both halves come from one factory so
+        # they share the start-time map.
+        start_hook = make_subagent_start_hook(record)
+        hooks["SubagentStart"] = [HookMatcher(hooks=[start_hook])]
+        hooks["SubagentStop"] = [HookMatcher(hooks=[make_subagent_stop_hook(start_hook)])]
 
     options = ClaudeAgentOptions(
         model=settings.model,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=MANAGER_PROMPT if team else SYSTEM_PROMPT,
         cwd=str(workspace),
         add_dirs=[str(project_root)] if profile != "sandboxed" else [],
         allowed_tools=allowed,
@@ -114,21 +145,25 @@ def build_options(
         permission_mode=permission_mode,
         can_use_tool=can_use_tool if permission_mode != "bypassPermissions" else None,
         hooks=hooks,
-        agents=AGENTS,
+        agents={**AGENTS, **TEAM} if team else AGENTS,
         mcp_servers=_load_mcp_servers(project_root),
         max_turns=max_turns,
         max_budget_usd=settings.max_budget_usd,
         # Deliberate: do not inherit ambient user/project/local settings. The harness
         # should behave identically on every machine and in CI.
         setting_sources=[],
-        env={},
+        # env is *merged* into the inherited environment by the Python SDK (the TS SDK
+        # replaces it -- do not copy this line across).
+        env=dict(SUBAGENT_LIMITS),
     )
     log.info(
         "options.built",
         profile=profile,
+        team=team,
         model=settings.model,
         permission_mode=permission_mode,
         allowed_tools=len(allowed),
+        agents=sorted(options.agents or {}),
         workspace=str(workspace),
     )
     return options

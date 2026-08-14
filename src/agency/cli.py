@@ -10,7 +10,10 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from agency.agents.team import TEAM
 from agency.config import Profile, get_settings
+from agency.hooks.delegation import delegations
+from agency.obs.cost import RunRecord
 from agency.obs.logging import configure_logging
 from agency.runner import Agent, Emit, run_once
 
@@ -25,7 +28,10 @@ def _make_emit(show_thinking: bool) -> Emit:
         elif kind == "thinking" and show_thinking:
             console.print(f"[dim italic]{text}[/dim italic]")
         elif kind == "tool":
-            console.print(f"[cyan]→ {text}[/cyan]")
+            # Agent/Task == a delegation. Colour it differently so the shape of a run
+            # is legible at a glance: magenta lines are the manager handing off work.
+            style = "magenta" if text in ("Agent", "Task") else "cyan"
+            console.print(f"[{style}]→ {text}[/{style}]")
         elif kind == "result":
             console.print(f"[dim]{text}[/dim]")
 
@@ -97,6 +103,64 @@ def doctor() -> None:
     console.print(f"workspace: {settings.resolved_workspace()}")
     console.print(f"runs:      {settings.resolved_run_dir()}")
     console.print(f".mcp.json: {'found' if Path('.mcp.json').exists() else 'absent'}")
+
+
+
+@app.command()
+def team(
+    prompt: Annotated[str, typer.Argument(help="What the manager should get done.")],
+    profile: Annotated[str | None, typer.Option("--profile", "-p")] = None,
+    thinking: Annotated[bool, typer.Option("--thinking")] = False,
+    interactive: Annotated[
+        bool,
+        typer.Option("--interactive", "-i", help="Stay in session after the first turn."),
+    ] = False,
+) -> None:
+    """Talk to the manager agent. It delegates to the workers in `agents/team.py`.
+
+    The manager is the main thread -- you are talking to it directly. Workers only
+    exist inside Agent tool calls (magenta arrows in the output).
+    """
+    active = _setup(profile)
+    emit = _make_emit(thinking)
+    roster = ", ".join(sorted(TEAM))
+
+    async def loop() -> None:
+        async with Agent(
+            profile=active, project_root=Path.cwd(), emit=emit, team=True
+        ) as agent:
+            console.print(
+                Panel(
+                    f"profile: [bold]{active}[/bold]  |  workers: [bold]{roster}[/bold]",
+                    title="agency team",
+                    expand=False,
+                )
+            )
+            record = await agent.ask(prompt)
+            _report(record)
+            while interactive:
+                try:
+                    follow_up = console.input("\n[bold green]>[/bold green] ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if not follow_up or follow_up in {"/exit", "/quit"}:
+                    break
+                _report(await agent.ask(follow_up))
+
+    asyncio.run(loop())
+
+
+def _report(record: RunRecord) -> None:
+    """Print the run summary plus who the manager actually delegated to."""
+    used = delegations(record)
+    console.print(
+        Panel(
+            f"{record.summary()}\n"
+            f"delegated to: {', '.join(used) if used else '[yellow]nobody[/yellow]'}",
+            title=f"run {record.run_id}",
+            expand=False,
+        )
+    )
 
 
 if __name__ == "__main__":

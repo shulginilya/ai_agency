@@ -1,0 +1,20 @@
+# The regression this catches: the manager quietly stops delegating and answers from
+# its own context. The prose stays plausible, so an output-only assertion passes while
+# the whole point of the architecture has evaporated. Assert on the trace.
+name: team_delegates_review
+prompt: >
+  Review src/agency/hooks/guardrails.py for ways a tool call could get past it.
+  Report the findings.
+profile: eval
+team: true
+assertions:
+  - type: succeeded
+  - type: tool_called
+    tool: Agent
+  - type: contains_any
+    values: ["reviewer", "finding", "severity"]
+  - type: no_blocked_calls
+  - type: max_turns
+    value: 15
+  - type: max_cost_usd
+    value: 0.60

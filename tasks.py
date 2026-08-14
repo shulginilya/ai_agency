@@ -80,6 +80,14 @@ def repl(rest: Sequence[str]) -> None:
     run("agency", "repl", *rest)
 
 
+def team(rest: Sequence[str]) -> None:
+    """Talk to the manager agent.  task team "your prompt here" """
+    if not rest:
+        print('usage: task team "your prompt"', file=sys.stderr)
+        sys.exit(2)
+    run("agency", "team", *rest)
+
+
 def doctor(rest: Sequence[str]) -> None:
     """Print resolved configuration."""
     run("agency", "doctor", *rest)
@@ -149,6 +157,7 @@ TASKS: dict[str, Callable[[Sequence[str]], None]] = {
     "install": install,
     "run": agent_run,
     "repl": repl,
+    "team": team,
     "doctor": doctor,
     "lint": lint,
     "fmt": fmt,

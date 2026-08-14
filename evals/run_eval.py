@@ -21,6 +21,7 @@ from typing import Any
 import yaml
 
 from agency.config import get_settings
+from agency.hooks.delegation import delegations
 from agency.obs.logging import configure_logging, get_logger
 from agency.runner import run_once
 from evals.scorers import Score, score_record
@@ -48,14 +49,17 @@ async def run_case(case: dict[str, Any], attempt: int) -> dict[str, Any]:
         case["prompt"],
         profile=case.get("profile", "eval"),
         project_root=Path.cwd(),
+        team=bool(case.get("team", False)),
     )
     scores: list[Score] = score_record(record, case.get("assertions", []))
     passed = all(s.passed for s in scores)
+    delegated = delegations(record)
     log.info(
         "eval.case",
         case=case["name"],
         attempt=attempt,
         passed=passed,
+        delegated_to=delegated,
         cost_usd=record.total_cost_usd,
     )
     return {
@@ -67,6 +71,9 @@ async def run_case(case: dict[str, Any], attempt: int) -> dict[str, Any]:
         "num_turns": record.num_turns,
         "duration_ms": record.duration_ms,
         "tools_used": record.tools_used(),
+        # Which workers ran is the load-bearing signal for team cases: a manager that
+        # stops delegating still produces plausible prose.
+        "delegated_to": delegated,
         "output": record.output,
         "scores": [asdict(s) for s in scores],
     }

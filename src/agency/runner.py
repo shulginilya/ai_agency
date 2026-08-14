@@ -44,11 +44,13 @@ class Agent:
         settings: Settings | None = None,
         project_root: Path | None = None,
         emit: Emit | None = None,
+        team: bool = False,
     ) -> None:
         self.settings = settings or get_settings()
         self.profile: Profile = profile or self.settings.profile
         self.project_root = project_root or Path.cwd()
         self.emit = emit or (lambda _kind, _text: None)
+        self.team = team
         self.record: RunRecord | None = None
         self._client: ClaudeSDKClient | None = None
 
@@ -66,6 +68,7 @@ class Agent:
             record=self.record,
             settings=self.settings,
             project_root=self.project_root,
+            team=self.team,
         )
         self._client = ClaudeSDKClient(options=options)
         await self._client.connect()
@@ -131,9 +134,10 @@ async def run_once(
     settings: Settings | None = None,
     project_root: Path | None = None,
     emit: Emit | None = None,
+    team: bool = False,
 ) -> RunRecord:
     """One-shot convenience wrapper."""
     async with Agent(
-        profile=profile, settings=settings, project_root=project_root, emit=emit
+        profile=profile, settings=settings, project_root=project_root, emit=emit, team=team
     ) as agent:
         return await agent.ask(prompt)
