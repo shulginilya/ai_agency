@@ -58,12 +58,17 @@ def run(*argv: str, check: bool = True) -> int:
 
 
 def install(_rest: Sequence[str]) -> None:
-    """Sync dependencies including dev extras."""
+    """Sync dependencies including dev and api extras."""
+    # Both extras are named explicitly even though `dev` already depends on
+    # `agency[api]`: self-referential extras resolve differently across pip versions,
+    # and a missing FastAPI would only surface as a skipped test file.
     if _uv_available():
-        subprocess.run(["uv", "sync", "--extra", "dev"], cwd=ROOT, check=True)  # noqa: S603, S607
+        subprocess.run(  # noqa: S603
+            ["uv", "sync", "--extra", "dev", "--extra", "api"], cwd=ROOT, check=True  # noqa: S607
+        )
     else:
         subprocess.run(  # noqa: S603
-            [sys.executable, "-m", "pip", "install", "-e", ".[dev]"], cwd=ROOT, check=True
+            [sys.executable, "-m", "pip", "install", "-e", ".[dev,api]"], cwd=ROOT, check=True
         )
 
 
@@ -86,6 +91,11 @@ def team(rest: Sequence[str]) -> None:
         print('usage: task team "your prompt"', file=sys.stderr)
         sys.exit(2)
     run("agency", "team", *rest)
+
+
+def serve(rest: Sequence[str]) -> None:
+    """Serve the HTTP API.  task serve [--port 8000] [--reload] """
+    run("agency", "serve", *rest)
 
 
 def doctor(rest: Sequence[str]) -> None:
@@ -158,6 +168,7 @@ TASKS: dict[str, Callable[[Sequence[str]], None]] = {
     "run": agent_run,
     "repl": repl,
     "team": team,
+    "serve": serve,
     "doctor": doctor,
     "lint": lint,
     "fmt": fmt,

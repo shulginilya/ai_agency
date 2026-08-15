@@ -35,9 +35,11 @@ commands to `tasks.py`, never to both.
 
 | Task | Does |
 |---|---|
-| `install` | Sync deps with dev extras (`uv sync`, or `pip install -e ".[dev]"`) |
+| `install` | Sync deps with dev + api extras (`uv sync`, or `pip install -e ".[dev,api]"`) |
 | `run "…"` | One-shot prompt |
 | `repl` | Interactive session, context retained across turns |
+| `team "…"` | Talk to the manager agent, which delegates to the workers |
+| `serve` | Serve the HTTP API (`--port`, `--reload`) |
 | `doctor` | Print resolved config, workspace path, MCP status |
 | `lint` / `fmt` | ruff check / ruff format + autofix |
 | `typecheck` | mypy over `src` and `evals` |
@@ -61,7 +63,52 @@ Run `python tasks.py` with no arguments to see the same list.
 | Permissions | `src/agency/permissions.py` | `can_use_tool` callback for anything that falls through to a prompt |
 | Cost accounting | `src/agency/obs/cost.py` | Per-run tokens, cost, turns from `ResultMessage` → `runs/{run_id}.json` |
 | Evals | `evals/` | YAML cases asserting on output *and* on the tool-call trace |
+| HTTP API | `src/agency/api/` | FastAPI app factory, RFC 9457 errors, admission control |
 | Sandbox | `Dockerfile`, `compose.yaml` | Non-root, workspace-only mount |
+
+## HTTP API
+
+```bash
+python tasks.py serve                       # http://127.0.0.1:8000, docs at /docs
+curl -s localhost:8000/healthz
+curl -s localhost:8000/v1/runs -H 'content-type: application/json' \
+     -d '{"prompt":"List the files in the workspace."}'
+```
+
+The web stack is an optional extra (`pip install -e ".[api]"`) so the CLI and the eval
+suite still install into an image with no web dependencies.
+
+| Route | Purpose |
+|---|---|
+| `GET /healthz` | Liveness. No dependencies, no auth — a failure means *restart me* |
+| `GET /readyz` | Readiness. Workspace writable, run dir writable, capacity |
+| `POST /v1/runs` | Run one prompt to completion. Returns the run record |
+
+**Shape worth copying.** Every endpoint goes: validate (`schemas.py`) → authorise
+(`require_api_key`) → admit (`RunSlots`) → bound (timeout) → delegate (the `Runner`
+protocol) → map to a wire model. Routes never import `agency.runner` or build
+`ClaudeAgentOptions`; `options.py` stays the single chokepoint, and the HTTP layer stays
+a thin adapter over the same path the CLI exercises.
+
+**Things that are deliberate, not incidental:**
+
+- **`is_error=True` is a 200.** The request succeeded; the agent failed. 5xx is reserved
+  for "we could not run it", so a client can tell the two apart.
+- **Errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem documents** —
+  including 404s from unknown routes and 422s from FastAPI's own validation. One shape,
+  always, with the `request_id` in the body and the header.
+- **Runs are admission-controlled.** `AGENCY_API_MAX_CONCURRENT_RUNS` slots; a saturated
+  server returns a retryable 503 rather than queueing subprocesses until it dies.
+- **Runs are time-bounded.** `AGENCY_API_RUN_TIMEOUT_S` cancels the coroutine, which
+  unwinds `Agent.__aexit__` and tears down the SDK subprocess — an orphaned run keeps
+  billing after the client has given up.
+- **The `Runner` protocol is the test seam.** `tests/test_api.py` drives the real ASGI
+  app with a fake runner: real routing, real middleware, real error handlers, zero cost.
+
+**Before it leaves your machine:** set `AGENCY_API_KEY`. The API executes arbitrary
+agent prompts, so an unauthenticated one is remote code execution with a REST interface.
+Run it behind a reverse proxy, keep `AGENCY_API_HOST=127.0.0.1` outside containers, and
+set `AGENCY_API_DOCS_ENABLED=false` in production.
 
 ## Two layers of safety
 

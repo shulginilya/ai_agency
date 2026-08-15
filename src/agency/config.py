@@ -34,6 +34,35 @@ class Settings(BaseSettings):
     log_format: Literal["console", "json"] = "console"
     run_dir: Path = Field(default=Path("runs"))
 
+    # --- HTTP API ------------------------------------------------------------------
+    # Defaults are deliberately conservative: loopback-only, auth off, docs on. A
+    # container that needs to accept traffic sets AGENCY_API_HOST=0.0.0.0 explicitly,
+    # so binding to every interface is always a decision someone made.
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
+    api_title: str = "agency"
+
+    # Unset => the auth dependency is a no-op. Set => every /v1 route requires it.
+    api_key: str | None = None
+
+    # Comma-separated, not a JSON list: pydantic-settings parses list-typed fields as
+    # JSON, so `AGENCY_API_CORS_ORIGINS=http://localhost:3000` would raise a validation
+    # error rather than doing the obvious thing. Kept a str, split in cors_origins().
+    api_cors_origins: str = ""
+
+    # An agent run is a long, bursty, subprocess-spawning job -- nothing like a normal
+    # request. These bound the damage: how many can be in flight, how long one may take,
+    # and how long a caller waits for a slot before being told to come back.
+    api_max_concurrent_runs: int = 4
+    api_run_timeout_s: float = 300.0
+    api_queue_timeout_s: float = 0.0
+
+    # Swagger/ReDoc/openapi.json. Turn off in production.
+    api_docs_enabled: bool = True
+
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.api_cors_origins.split(",") if origin.strip()]
+
     def resolved_workspace(self) -> Path:
         path = self.workspace_dir.resolve()
         path.mkdir(parents=True, exist_ok=True)
