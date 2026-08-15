@@ -1,27 +1,54 @@
+x-agency-base: &agency-base
+  build: .
+  image: agency:latest
+  environment: &agency-env
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}
+    AGENCY_PROFILE: ${AGENCY_PROFILE:-sandboxed}
+    AGENCY_MODEL: ${AGENCY_MODEL:-claude-sonnet-5}
+    AGENCY_MAX_BUDGET_USD: ${AGENCY_MAX_BUDGET_USD:-2.00}
+  volumes:
+    # Only the workspace is writable. Source is read-only so the agent cannot
+    # rewrite its own guardrails.
+    - ./workspace:/app/workspace:rw
+    - ./runs:/app/runs:rw
+    - ./src:/app/src:ro
+  # Defence in depth: no new privileges, dropped caps, bounded resources.
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: false
+  tmpfs:
+    - /tmp
+  mem_limit: 2g
+  pids_limit: 512
+
 services:
   agent:
-    build: .
-    image: agency:latest
-    environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env}
-      AGENCY_PROFILE: ${AGENCY_PROFILE:-sandboxed}
-      AGENCY_MODEL: ${AGENCY_MODEL:-claude-sonnet-5}
-      AGENCY_MAX_BUDGET_USD: ${AGENCY_MAX_BUDGET_USD:-2.00}
-    volumes:
-      # Only the workspace is writable. Source is read-only so the agent cannot
-      # rewrite its own guardrails.
-      - ./workspace:/app/workspace:rw
-      - ./runs:/app/runs:rw
-      - ./src:/app/src:ro
-    # Defence in depth: no new privileges, dropped caps, bounded resources.
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    read_only: false
-    tmpfs:
-      - /tmp
-    mem_limit: 2g
-    pids_limit: 512
+    <<: *agency-base
     stdin_open: true
     tty: true
+
+  api:
+    <<: *agency-base
+    command: ["serve"]
+    ports:
+      # Loopback on the host side: an agent API on 0.0.0.0 is remote code execution
+      # with a REST interface. Put a reverse proxy in front of it before exposing it,
+      # and set AGENCY_API_KEY.
+      - "127.0.0.1:${AGENCY_API_PORT:-8000}:8000"
+    environment:
+      <<: *agency-env
+      AGENCY_API_KEY: ${AGENCY_API_KEY:-}
+      AGENCY_API_MAX_CONCURRENT_RUNS: ${AGENCY_API_MAX_CONCURRENT_RUNS:-4}
+      AGENCY_API_RUN_TIMEOUT_S: ${AGENCY_API_RUN_TIMEOUT_S:-300}
+      AGENCY_API_DOCS_ENABLED: ${AGENCY_API_DOCS_ENABLED:-true}
+    healthcheck:
+      # Liveness only. /readyz touches the filesystem, which is not what a restart
+      # decision should hinge on.
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped

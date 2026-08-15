@@ -95,6 +95,66 @@ def repl(
 
 
 @app.command()
+def serve(
+    host: Annotated[str | None, typer.Option("--host", help="Override AGENCY_API_HOST.")] = None,
+    port: Annotated[int | None, typer.Option("--port", help="Override AGENCY_API_PORT.")] = None,
+    reload: Annotated[bool, typer.Option("--reload", help="Autoreload on code change.")] = False,
+) -> None:
+    """Serve the HTTP API.
+
+    Needs the optional web dependencies: `pip install -e ".[api]"`.
+    """
+    settings = get_settings()
+    configure_logging(settings.log_level, settings.log_format)
+
+    try:
+        from agency.api.app import serve as _serve
+    except ModuleNotFoundError as exc:  # fastapi / uvicorn not installed
+        console.print(
+            f"[red]missing dependency:[/red] {exc.name}\n"
+            'install the API extra:  [bold]pip install -e ".[api]"[/bold]'
+            "  (or [bold]uv sync --extra api[/bold])"
+        )
+        raise typer.Exit(code=1) from exc
+
+    if host is not None or port is not None:
+        settings = settings.model_copy(
+            update={
+                "api_host": settings.api_host if host is None else host,
+                "api_port": settings.api_port if port is None else port,
+            }
+        )
+
+    console.print(
+        Panel(
+            f"http://{settings.api_host}:{settings.api_port}\n"
+            f"profile: [bold]{settings.profile}[/bold]  |  "
+            f"auth: [bold]{'api-key' if settings.api_key else 'open'}[/bold]  |  "
+            f"docs: {'/docs' if settings.api_docs_enabled else 'disabled'}",
+            title="agency serve",
+            expand=False,
+        )
+    )
+
+    if reload:
+        # Reload spawns a fresh worker process, so uvicorn needs an import string it can
+        # re-import -- not an app object. That is what `agency.api.asgi` exists for.
+        import uvicorn
+
+        uvicorn.run(
+            "agency.api.asgi:app",
+            host=settings.api_host,
+            port=settings.api_port,
+            reload=True,
+            log_config=None,
+            access_log=False,
+        )
+        return
+
+    _serve(settings)
+
+
+@app.command()
 def doctor() -> None:
     """Print resolved configuration. Useful when a run behaves unexpectedly."""
     settings = get_settings()
@@ -103,6 +163,8 @@ def doctor() -> None:
     console.print(f"workspace: {settings.resolved_workspace()}")
     console.print(f"runs:      {settings.resolved_run_dir()}")
     console.print(f".mcp.json: {'found' if Path('.mcp.json').exists() else 'absent'}")
+    auth = "api-key" if settings.api_key else "open"
+    console.print(f"api:       http://{settings.api_host}:{settings.api_port} ({auth})")
 
 
 
