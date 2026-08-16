@@ -66,7 +66,10 @@ class RequestContextMiddleware:
             if message["type"] == "http.response.start":
                 status_holder["status"] = int(message["status"])
                 headers = MutableHeaders(scope=message)
-                headers.append(REQUEST_ID_HEADER, request_id)
+                # setdefault, not append: `errors.problem()` already sets this header on
+                # every problem+json response, so appending emits it twice and a client
+                # reading `x-request-id` gets "abc, abc".
+                headers.setdefault(REQUEST_ID_HEADER, request_id)
             await send(message)
 
         tokens = structlog.contextvars.bind_contextvars(request_id=request_id)

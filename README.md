@@ -105,6 +105,26 @@ a thin adapter over the same path the CLI exercises.
 - **The `Runner` protocol is the test seam.** `tests/test_api.py` drives the real ASGI
   app with a fake runner: real routing, real middleware, real error handlers, zero cost.
 
+### Calling it from a browser
+
+CORS is off until you configure an origin — nothing is installed, so every cross-origin
+request fails. Set one of:
+
+```bash
+AGENCY_API_CORS_ORIGINS=http://localhost:3000        # exact origins, comma-separated
+AGENCY_API_CORS_ORIGIN_REGEX='http://(localhost|127\.0\.0\.1):\d{1,5}'   # any dev port
+```
+
+Auth travels as `X-API-Key` or `Authorization: Bearer` — plain headers, not CORS
+"credentials" — so leave `AGENCY_API_CORS_ALLOW_CREDENTIALS=false` unless the frontend
+authenticates with cookies. It is incompatible with `AGENCY_API_CORS_ORIGINS=*`; set both
+and the wildcard wins.
+
+Two details that exist so failures stay legible from a browser: allowed methods are
+derived from the routers, so a new endpoint cannot silently fail preflight; and unhandled
+500s are rendered *inside* the CORS layer, so a server error reaches the console as a 500
+with its problem document rather than as an opaque CORS error.
+
 **Before it leaves your machine:** set `AGENCY_API_KEY`. The API executes arbitrary
 agent prompts, so an unauthenticated one is remote code execution with a REST interface.
 Run it behind a reverse proxy, keep `AGENCY_API_HOST=127.0.0.1` outside containers, and

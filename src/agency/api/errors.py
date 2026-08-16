@@ -16,6 +16,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from agency.api.middleware import REQUEST_ID_HEADER
 from agency.obs.logging import get_logger
@@ -126,6 +127,61 @@ def problem(
     )
 
 
+def unexpected_problem(request: Request, exc: BaseException) -> JSONResponse:
+    """The 500 body. One function so the two paths that can produce it -- the middleware
+    below and FastAPI's own `Exception` handler -- cannot drift apart."""
+    log.exception("api.unhandled", path=request.url.path, error=str(exc))
+    return problem(
+        request,
+        status=500,
+        title="Internal Server Error",
+        detail="The server hit an unexpected condition. The failure has been logged.",
+        type_uri=f"{PROBLEM_BASE}/internal-error",
+    )
+
+
+class ProblemFallbackMiddleware:
+    """Render unhandled exceptions *inside* the middleware stack.
+
+    FastAPI does not treat an `Exception` handler like the others: Starlette hands it to
+    `ServerErrorMiddleware`, which wraps every user middleware -- CORS included. A 500
+    rendered there therefore carries no `Access-Control-Allow-Origin`, so a browser client
+    sees an opaque CORS failure instead of the 500 that actually happened, and the problem
+    document never reaches the console. Catching below CORS keeps the body identical and
+    lets the CORS layer add its headers on the way out.
+
+    Mounted innermost of the user middleware, so `ExceptionMiddleware` (which handles
+    `APIError`, `HTTPException` and validation errors) still runs first and this only sees
+    what nobody planned for.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        response_started = False
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception as exc:
+            if response_started:
+                # The status line is already on the wire; there is no honest way to turn
+                # this into a 500. Let it propagate and be logged upstream.
+                raise
+            response = unexpected_problem(Request(scope, receive), exc)
+            await response(scope, receive, send)
+
+
 def install_error_handlers(app: FastAPI) -> None:
     """Register every handler. Called once by the app factory."""
 
@@ -182,14 +238,9 @@ def install_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
-        log.exception("api.unhandled", path=request.url.path, error=str(exc))
-        return problem(
-            request,
-            status=500,
-            title="Internal Server Error",
-            detail="The server hit an unexpected condition. The failure has been logged.",
-            type_uri=f"{PROBLEM_BASE}/internal-error",
-        )
+        # Kept as a backstop. In practice `ProblemFallbackMiddleware` gets there first;
+        # this covers anything raised above it, where CORS headers are unreachable anyway.
+        return unexpected_problem(request, exc)
 
 
 def _serialisable_errors(exc: RequestValidationError) -> list[dict[str, Any]]:

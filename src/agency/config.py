@@ -48,7 +48,27 @@ class Settings(BaseSettings):
     # Comma-separated, not a JSON list: pydantic-settings parses list-typed fields as
     # JSON, so `AGENCY_API_CORS_ORIGINS=http://localhost:3000` would raise a validation
     # error rather than doing the obvious thing. Kept a str, split in cors_origins().
+    #
+    # Empty => no CORS middleware at all. That is the right default for a loopback API
+    # with no browser client, but it is also the most common reason a frontend cannot
+    # reach this: nothing is misconfigured, the layer simply is not installed.
     api_cors_origins: str = ""
+
+    # An exact-origin list cannot express "any port on localhost" (a dev server moves
+    # ports) or "any preview deploy of this app" (a new hostname per branch). A regex
+    # covers those without widening to every origin. Starlette matches it with
+    # `fullmatch`, so it needs no anchors -- but it does need care: `http://localhost:.*`
+    # also matches `http://localhost:1@evil.example`. Constrain the tail, as the
+    # `.env.example` default does.
+    api_cors_origin_regex: str | None = None
+
+    # Off by default, and a setting rather than a constant. This API authenticates with
+    # the `X-API-Key`/`Authorization` headers (see api/deps.py), which are not credentials
+    # in the CORS sense, so the default costs nothing. Turning it on is only meaningful
+    # behind a cookie-session proxy, and it is not free: `Allow-Credentials: true` is
+    # incompatible with a wildcard origin, so leaving it on would silently rule out
+    # `AGENCY_API_CORS_ORIGINS=*`.
+    api_cors_allow_credentials: bool = False
 
     # An agent run is a long, bursty, subprocess-spawning job -- nothing like a normal
     # request. These bound the damage: how many can be in flight, how long one may take,
@@ -62,6 +82,15 @@ class Settings(BaseSettings):
 
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.api_cors_origins.split(",") if origin.strip()]
+
+    def cors_origin_regex(self) -> str | None:
+        """Normalise "" and whitespace to None -- an empty env var must mean "unset",
+        not a regex that fullmatches the empty origin and nothing else."""
+        regex = (self.api_cors_origin_regex or "").strip()
+        return regex or None
+
+    def cors_enabled(self) -> bool:
+        return bool(self.cors_origins() or self.cors_origin_regex())
 
     def resolved_workspace(self) -> Path:
         path = self.workspace_dir.resolve()

@@ -20,7 +20,7 @@ import httpx
 import pytest
 
 from agency.api.app import create_app
-from agency.api.deps import get_runner
+from agency.api.deps import get_runner, get_slots
 from agency.api.errors import CONTENT_TYPE
 from agency.config import Profile, Settings
 from agency.obs.cost import RunRecord, ToolCall
@@ -279,3 +279,192 @@ async def test_docs_can_be_switched_off(api_settings: Settings) -> None:
     async with make_client(quiet, FakeRunner()) as c:
         assert (await c.get("/openapi.json")).status_code == 404
         assert (await c.get("/docs")).status_code == 404
+
+
+# --- CORS ----------------------------------------------------------------------------
+# The browser-facing contract. Worth testing precisely because it is invisible to curl:
+# every assertion here covers something that fails only in a browser, and reports itself
+# as the same opaque "CORS error" regardless of which one it was.
+
+DEV_ORIGIN = "http://localhost:3000"
+DEV_REGEX = r"http://(localhost|127\.0\.0\.1):\d{1,5}"
+
+PREFLIGHT = {
+    "Origin": DEV_ORIGIN,
+    "Access-Control-Request-Method": "POST",
+    "Access-Control-Request-Headers": "content-type,x-api-key",
+}
+
+
+def cors_settings(base: Settings, **overrides: Any) -> Settings:
+    """Pin every CORS field, always.
+
+    Without this the assertions below silently depend on whatever the developer happens
+    to have in their `.env` -- and the negative cases ("no CORS configured") would start
+    failing the moment someone sets the origins for real.
+    """
+    return base.model_copy(
+        update={
+            "api_cors_origins": "",
+            "api_cors_origin_regex": None,
+            "api_cors_allow_credentials": False,
+            **overrides,
+        }
+    )
+
+
+async def test_no_cors_configured_means_no_cors_headers(api_settings: Settings) -> None:
+    async with make_client(cors_settings(api_settings), FakeRunner()) as c:
+        response = await c.post("/v1/runs", json={"prompt": "x"}, headers={"Origin": DEV_ORIGIN})
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers
+
+
+async def test_preflight_is_allowed_for_a_configured_origin(api_settings: Settings) -> None:
+    configured = cors_settings(api_settings, api_cors_origins=DEV_ORIGIN)
+    async with make_client(configured, FakeRunner()) as c:
+        response = await c.options("/v1/runs", headers=PREFLIGHT)
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == DEV_ORIGIN
+    assert "POST" in response.headers["access-control-allow-methods"]
+    assert "x-api-key" in response.headers["access-control-allow-headers"].lower()
+
+
+async def test_preflight_never_reaches_auth(api_settings: Settings) -> None:
+    # CORSMiddleware answers the preflight above the router, so it must succeed even with
+    # a key configured -- browsers do not send credentials on a preflight, and a 401 here
+    # would make an authenticated API unusable from any frontend.
+    secured = cors_settings(api_settings, api_cors_origins=DEV_ORIGIN, api_key="s3cret")
+    async with make_client(secured, FakeRunner()) as c:
+        assert (await c.options("/v1/runs", headers=PREFLIGHT)).status_code == 200
+
+
+async def test_a_simple_request_echoes_the_origin_and_exposes_headers(
+    api_settings: Settings,
+) -> None:
+    configured = cors_settings(api_settings, api_cors_origins=f"{DEV_ORIGIN},https://app.example")
+    async with make_client(configured, FakeRunner()) as c:
+        response = await c.post("/v1/runs", json={"prompt": "x"}, headers={"Origin": DEV_ORIGIN})
+    assert response.headers["access-control-allow-origin"] == DEV_ORIGIN
+    exposed = response.headers["access-control-expose-headers"].lower()
+    assert "x-request-id" in exposed
+    assert "retry-after" in exposed  # a client cannot back off from a 503 it cannot read
+
+
+async def test_an_unconfigured_origin_is_refused(api_settings: Settings) -> None:
+    configured = cors_settings(api_settings, api_cors_origins=DEV_ORIGIN)
+    async with make_client(configured, FakeRunner()) as c:
+        response = await c.options(
+            "/v1/runs", headers={**PREFLIGHT, "Origin": "https://evil.example"}
+        )
+    assert "access-control-allow-origin" not in response.headers
+
+
+@pytest.mark.parametrize(
+    ("origin", "allowed"),
+    [
+        ("http://localhost:3000", True),
+        ("http://localhost:5173", True),
+        ("http://127.0.0.1:8080", True),
+        ("https://localhost:3000", False),  # scheme is part of the origin
+        ("http://localhost.evil.example", False),
+        ("http://localhost:3000.evil.example", False),  # fullmatch, not search
+    ],
+)
+async def test_the_origin_regex_matches_dev_ports_and_nothing_else(
+    api_settings: Settings, origin: str, allowed: bool
+) -> None:
+    configured = cors_settings(api_settings, api_cors_origin_regex=DEV_REGEX)
+    async with make_client(configured, FakeRunner()) as c:
+        response = await c.options("/v1/runs", headers={**PREFLIGHT, "Origin": origin})
+    assert ("access-control-allow-origin" in response.headers) is allowed
+
+
+async def test_wildcard_origin_drops_credentials_rather_than_breaking(
+    api_settings: Settings,
+) -> None:
+    # `Allow-Origin: *` with `Allow-Credentials: true` is rejected by every browser. Given
+    # the pair, keep the wildcard working rather than shipping a config that looks right
+    # and fails on every request.
+    configured = cors_settings(api_settings, api_cors_origins="*", api_cors_allow_credentials=True)
+    async with make_client(configured, FakeRunner()) as c:
+        response = await c.post("/v1/runs", json={"prompt": "x"}, headers={"Origin": DEV_ORIGIN})
+    assert response.headers["access-control-allow-origin"] == "*"
+    assert "access-control-allow-credentials" not in response.headers
+
+
+async def test_credentials_are_sent_for_an_exact_origin_when_enabled(
+    api_settings: Settings,
+) -> None:
+    configured = cors_settings(
+        api_settings, api_cors_origins=DEV_ORIGIN, api_cors_allow_credentials=True
+    )
+    async with make_client(configured, FakeRunner()) as c:
+        response = await c.post("/v1/runs", json={"prompt": "x"}, headers={"Origin": DEV_ORIGIN})
+    assert response.headers["access-control-allow-credentials"] == "true"
+
+
+async def test_allowed_methods_are_derived_from_the_router(api_settings: Settings) -> None:
+    # Guards against the hardcoded list drifting from the routes as endpoints are added.
+    configured = cors_settings(api_settings, api_cors_origins=DEV_ORIGIN)
+    async with make_client(configured, FakeRunner()) as c:
+        response = await c.options("/v1/runs", headers=PREFLIGHT)
+    allowed = {m.strip() for m in response.headers["access-control-allow-methods"].split(",")}
+    assert {"GET", "POST", "OPTIONS"} <= allowed
+
+
+# --- CORS headers on failures --------------------------------------------------------
+# The failure mode these cover: an error response without CORS headers is unreadable to
+# the browser, so the frontend reports a CORS problem and the actual status and problem
+# document -- the things that say what went wrong -- never surface.
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "expected"),
+    [
+        ("/v1/runs", {}, 422),  # validation
+        ("/v1/nope", None, 404),  # routing
+    ],
+)
+async def test_handled_errors_carry_cors_headers(
+    api_settings: Settings, path: str, payload: dict[str, Any] | None, expected: int
+) -> None:
+    configured = cors_settings(api_settings, api_cors_origins=DEV_ORIGIN)
+    async with make_client(configured, FakeRunner()) as c:
+        response = await c.post(path, json=payload, headers={"Origin": DEV_ORIGIN})
+    assert response.status_code == expected
+    assert response.headers["access-control-allow-origin"] == DEV_ORIGIN
+
+
+async def test_an_unhandled_exception_is_a_500_that_carries_cors_headers(
+    api_settings: Settings,
+) -> None:
+    # FastAPI hands the `Exception` handler to ServerErrorMiddleware, which sits *outside*
+    # CORS -- so without `ProblemFallbackMiddleware` this response has no CORS headers and
+    # the browser hides a 500 behind a CORS error. Raising from a dependency puts the
+    # exception outside the route's own try/except, which is the path that reaches it.
+    def boom() -> None:
+        raise RuntimeError("something nobody planned for")
+
+    configured = cors_settings(api_settings, api_cors_origins=DEV_ORIGIN)
+    app = create_app(configured, runner=FakeRunner())
+    app.dependency_overrides[get_slots] = boom
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        response = await c.post("/v1/runs", json={"prompt": "x"}, headers={"Origin": DEV_ORIGIN})
+
+    assert response.status_code == 500
+    assert response.headers["access-control-allow-origin"] == DEV_ORIGIN
+    assert response.headers["content-type"].startswith(CONTENT_TYPE)
+    assert response.json()["type"].endswith("/internal-error")
+    assert "nobody planned for" not in response.text  # internals stay in the log
+
+
+async def test_an_error_response_carries_exactly_one_request_id(
+    client: httpx.AsyncClient,
+) -> None:
+    # `problem()` sets the header and the middleware used to append it again, so clients
+    # read "abc, abc" on every error while the 200 path looked fine.
+    response = await client.post("/v1/runs", json={}, headers={"x-request-id": "trace-abc"})
+    assert response.status_code == 422
+    assert response.headers["x-request-id"] == "trace-abc"
