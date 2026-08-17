@@ -7,6 +7,6 @@ breaking change can ship as `/v2` alongside it rather than in place of it.
 
 from __future__ import annotations
 
-from agency.api.routers import health, runs
+from agency.api.routers import agents, health, runs
 
-__all__ = ["health", "runs"]
+__all__ = ["agents", "health", "runs"]

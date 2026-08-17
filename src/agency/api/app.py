@@ -23,7 +23,7 @@ from starlette.routing import BaseRoute
 from agency.api.deps import API_KEY_HEADER, Runner, RunSlots, make_runner
 from agency.api.errors import ProblemFallbackMiddleware, install_error_handlers
 from agency.api.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
-from agency.api.routers import health, runs
+from agency.api.routers import agents, health, runs
 from agency.api.version import API_VERSION, VERSION
 from agency.config import Settings, get_settings
 from agency.obs.logging import configure_logging, get_logger
@@ -42,6 +42,7 @@ problem documents.
 TAGS: list[dict[str, Any]] = [
     {"name": "health", "description": "Liveness and readiness probes. Never authenticated."},
     {"name": "runs", "description": "Execute agent runs."},
+    {"name": "agents", "description": "Agent discovery. Placeholder -- not implemented yet."},
 ]
 
 
@@ -110,13 +111,14 @@ def create_app(
 
     app.include_router(health.router)
     app.include_router(runs.router, prefix=f"/{API_VERSION}")
+    app.include_router(agents.router, prefix=f"/{API_VERSION}")
 
     # `add_middleware` prepends, so the LAST one added is the outermost and runs first.
     # Added innermost-first below, which reads backwards but puts each layer where it has
     # to be: the fallback inside CORS (so a 500 still gets CORS headers), CORS inside the
     # request-id layer (so every response, including a preflight, is logged and tagged).
     app.add_middleware(ProblemFallbackMiddleware)
-    _install_cors(app, settings, _allowed_methods(health.router, runs.router))
+    _install_cors(app, settings, _allowed_methods(health.router, runs.router, agents.router))
     app.add_middleware(RequestContextMiddleware)
 
     return app
