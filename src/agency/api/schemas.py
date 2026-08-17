@@ -86,6 +86,18 @@ class RunResponse(BaseModel):
         )
 
 
+class AgentsResponse(BaseModel):
+    """Placeholder body for `GET /v1/agents`.
+
+    Agent discovery (listing the manager/worker roster from `agents/team.py`) is not
+    implemented yet. The endpoint is wired up now so the route shape -- path, versioning,
+    response envelope -- is fixed early; when real data lands it is a body change, not a
+    new route. `status` is the only field on purpose, matching what was asked for.
+    """
+
+    status: Literal["pending"] = "pending"
+
+
 class Health(BaseModel):
     """Liveness. Cheap and dependency-free by design -- a liveness probe that checks
     dependencies restarts the process when a dependency blips, which is backwards."""
