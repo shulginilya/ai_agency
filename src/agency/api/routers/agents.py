@@ -28,7 +28,7 @@ router = APIRouter(
     response_model=AgentsResponse,
     status_code=status.HTTP_200_OK,
     summary="List available agents (placeholder)",
-    response_description="Always {'status': 'pending'} today -- agent discovery is not implemented yet.",
+    response_description="{'status': 'pending'} - agent discovery is not implemented yet.",
 )
 async def list_agents() -> AgentsResponse:
     return AgentsResponse()
