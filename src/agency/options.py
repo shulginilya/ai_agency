@@ -22,7 +22,11 @@ from agency.hooks.audit import (
     make_post_audit_hook,
     make_pre_audit_hook,
 )
-from agency.hooks.delegation import make_subagent_start_hook, make_subagent_stop_hook
+from agency.hooks.delegation import (
+    make_delegation_failure_hook,
+    make_subagent_start_hook,
+    make_subagent_stop_hook,
+)
 from agency.hooks.guardrails import make_guardrail_hook
 from agency.obs.cost import RunRecord
 from agency.obs.logging import get_logger
@@ -121,19 +125,26 @@ def build_options(
         permission_mode = "bypassPermissions"  # deterministic: never prompt
         max_turns = min(max_turns, 20)
 
+    # Subagent lifecycle. PostToolUse sees the Agent *call*; only these see which worker
+    # actually ran and for how long. Both halves of the start/stop pair come from one
+    # factory so they share the start-time map.
+    #
+    # Registered unconditionally, unlike the audit hooks: these also feed
+    # `obs.agent_state.REGISTRY`, which backs `GET /v1/agents`. Gating them on `record`
+    # would make live agent status quietly depend on whether the caller wanted a tool
+    # trace -- two unrelated things, and the symptom would be an agent stuck on `idle`
+    # while it is visibly running.
+    start_hook = make_subagent_start_hook(record)
     hooks: dict[HookEvent, list[HookMatcher]] = {
         "PreToolUse": [HookMatcher(hooks=[make_guardrail_hook(workspace, record)])],
+        "PostToolUseFailure": [HookMatcher(hooks=[make_delegation_failure_hook()])],
+        "SubagentStart": [HookMatcher(hooks=[start_hook])],
+        "SubagentStop": [HookMatcher(hooks=[make_subagent_stop_hook(start_hook)])],
     }
     if record is not None:
         hooks["PreToolUse"].append(HookMatcher(hooks=[make_pre_audit_hook(record)]))
         hooks["PostToolUse"] = [HookMatcher(hooks=[make_post_audit_hook(record)])]
-        hooks["PostToolUseFailure"] = [HookMatcher(hooks=[make_failure_audit_hook(record)])]
-        # Subagent lifecycle. PostToolUse sees the Agent *call*; only these see which
-        # worker actually ran and for how long. Both halves come from one factory so
-        # they share the start-time map.
-        start_hook = make_subagent_start_hook(record)
-        hooks["SubagentStart"] = [HookMatcher(hooks=[start_hook])]
-        hooks["SubagentStop"] = [HookMatcher(hooks=[make_subagent_stop_hook(start_hook)])]
+        hooks["PostToolUseFailure"].append(HookMatcher(hooks=[make_failure_audit_hook(record)]))
 
     options = ClaudeAgentOptions(
         model=settings.model,

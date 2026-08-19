@@ -19,10 +19,13 @@ from typing import Any
 import httpx
 import pytest
 
+from agency.agents.definitions import AGENTS
+from agency.agents.team import TEAM
 from agency.api.app import create_app
 from agency.api.deps import get_runner, get_slots
 from agency.api.errors import CONTENT_TYPE
 from agency.config import Profile, Settings
+from agency.obs.agent_state import REGISTRY
 from agency.obs.cost import RunRecord, ToolCall
 
 
@@ -138,6 +141,112 @@ async def test_every_response_carries_a_request_id(client: httpx.AsyncClient) ->
 async def test_an_inbound_request_id_is_preserved(client: httpx.AsyncClient) -> None:
     response = await client.get("/healthz", headers={"x-request-id": "trace-abc"})
     assert response.headers["x-request-id"] == "trace-abc"
+
+
+# --- agent discovery -----------------------------------------------------------------
+# Asserted against the live rosters, not a hardcoded list: the point of the endpoint is
+# that it cannot drift from what `options.build_options` actually loads, so a test that
+# restates the names would pass through exactly the drift it is meant to catch.
+#
+# The state machine itself is covered in test_agent_state.py; what is asserted here is
+# only that the HTTP layer reports it.
+
+
+@pytest.fixture(autouse=True)
+def clean_agent_registry() -> Any:
+    # REGISTRY is module-level. Without this, a test that starts an agent leaves every
+    # later test reading `running`, and the failures depend on collection order.
+    REGISTRY.reset()
+    yield
+    REGISTRY.reset()
+
+
+async def test_agents_reports_live_status_over_http(client: httpx.AsyncClient) -> None:
+    REGISTRY.record_start("reviewer")
+    by_name = {a["name"]: a for a in (await client.get("/v1/agents")).json()["agents"]}
+    assert by_name["reviewer"]["status"] == "running"
+    assert by_name["reviewer"]["invocations"] == 1
+    assert by_name["critic"]["status"] == "idle"
+
+
+async def test_updated_at_is_never_null_and_is_stable_for_an_idle_agent(
+    client: httpx.AsyncClient,
+) -> None:
+    async def critic() -> dict[str, Any]:
+        agents = (await client.get("/v1/agents")).json()["agents"]
+        return dict(next(a for a in agents if a["name"] == "critic"))
+
+    first = await critic()
+    assert first["updated_at"] is not None
+    # And it does not move just because someone asked again -- an updated_at that
+    # advanced per request would read as activity on an agent doing nothing.
+    assert (await critic())["updated_at"] == first["updated_at"]
+    # `invocations`, not a null timestamp, is what marks it as never having run.
+    assert first["invocations"] == 0
+
+
+async def test_agents_status_follows_a_worker_through_its_lifecycle(
+    client: httpx.AsyncClient,
+) -> None:
+    async def status_of(name: str) -> str:
+        agents = (await client.get("/v1/agents")).json()["agents"]
+        return str(next(a for a in agents if a["name"] == name)["status"])
+
+    assert await status_of("reviewer") == "idle"
+    REGISTRY.record_start("reviewer")
+    assert await status_of("reviewer") == "running"
+    REGISTRY.record_stop("reviewer")
+    assert await status_of("reviewer") == "idle"
+    REGISTRY.record_failure("reviewer")
+    assert await status_of("reviewer") == "error"
+
+
+async def test_agents_lists_the_live_rosters(client: httpx.AsyncClient) -> None:
+    response = await client.get("/v1/agents")
+    assert response.status_code == 200
+    body = response.json()
+    assert [a["name"] for a in body["agents"]] == sorted(AGENTS) + sorted(TEAM)
+    assert body["count"] == len(AGENTS) + len(TEAM)
+
+
+async def test_agents_marks_team_only_workers(client: httpx.AsyncClient) -> None:
+    # The distinction a client acts on: a "team" agent is absent unless the run is
+    # started with team=true, so listing them flat would be a lie half the time.
+    by_name = {a["name"]: a for a in (await client.get("/v1/agents")).json()["agents"]}
+    assert {n: by_name[n]["availability"] for n in AGENTS} == dict.fromkeys(AGENTS, "always")
+    assert {n: by_name[n]["availability"] for n in TEAM} == dict.fromkeys(TEAM, "team")
+
+
+async def test_agents_maps_the_definition_fields(client: httpx.AsyncClient) -> None:
+    by_name = {a["name"]: a for a in (await client.get("/v1/agents")).json()["agents"]}
+    entry = by_name["reviewer"]
+    assert entry["description"] == TEAM["reviewer"].description
+    assert entry["model"] == TEAM["reviewer"].model
+    assert entry["tools"] == TEAM["reviewer"].tools
+    # camelCase in, snake_case out -- the SDK's naming must not leak into the contract.
+    assert entry["max_turns"] == TEAM["reviewer"].maxTurns
+    assert "maxTurns" not in entry
+
+
+async def test_agents_never_exposes_a_system_prompt(client: httpx.AsyncClient) -> None:
+    # Prompts are implementation detail. Publishing one makes every prompt tweak a
+    # breaking change, and hands an attacker the guardrail wording to work around.
+    response = await client.get("/v1/agents")
+    assert all("prompt" not in a for a in response.json()["agents"])
+    assert "code review specialist" not in response.text
+
+
+async def test_agents_does_not_touch_the_runner(client: httpx.AsyncClient) -> None:
+    await client.get("/v1/agents")
+    assert client.runner.calls == []  # type: ignore[attr-defined]
+
+
+async def test_agents_requires_a_key_when_one_is_configured(api_settings: Settings) -> None:
+    # It enumerates each worker's tools, i.e. the harness's write/exec surface.
+    secured = api_settings.model_copy(update={"api_key": "s3cret"})
+    async with make_client(secured, FakeRunner()) as c:
+        assert (await c.get("/v1/agents")).status_code == 401
+        assert (await c.get("/v1/agents", headers={"X-API-Key": "s3cret"})).status_code == 200
 
 
 # --- validation ----------------------------------------------------------------------

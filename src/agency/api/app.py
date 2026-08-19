@@ -42,7 +42,7 @@ problem documents.
 TAGS: list[dict[str, Any]] = [
     {"name": "health", "description": "Liveness and readiness probes. Never authenticated."},
     {"name": "runs", "description": "Execute agent runs."},
-    {"name": "agents", "description": "Agent discovery. Placeholder -- not implemented yet."},
+    {"name": "agents", "description": "Agent discovery: which subagents this server can invoke."},
 ]
 
 
