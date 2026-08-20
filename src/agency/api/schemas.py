@@ -140,6 +140,37 @@ class AgentStatus(str, Enum):
         return cls.IDLE
 
 
+def _roster_entries() -> list[tuple[str, AgentDefinition, Availability]]:
+    """The full roster, flattened and ordered, in one place.
+
+    Both the collection and the single-agent lookup read this, so an agent that shows up
+    in `GET /v1/agents` cannot 404 on `GET /v1/agents/{id}` -- two independent walks of
+    the rosters would eventually disagree, and that disagreement is invisible in tests
+    that only exercise one of them.
+
+    The rosters are imported here, not at module scope: `agency.agents.*` pulls in the
+    SDK, and `agency.api` stays importable without it (`--help`, OpenAPI generation).
+    Same reason `deps.make_runner` defers its import.
+    """
+    from agency.agents.definitions import AGENTS
+    from agency.agents.team import TEAM
+
+    rosters: tuple[tuple[dict[str, AgentDefinition], Availability], ...] = (
+        (AGENTS, "always"),
+        (TEAM, "team"),
+    )
+    return [
+        (name, roster[name], availability)
+        for roster, availability in rosters
+        for name in sorted(roster)
+    ]
+
+
+def known_agent_names() -> list[str]:
+    """Every invocable agent name, in response order. Used to make a 404 actionable."""
+    return [name for name, _definition, _availability in _roster_entries()]
+
+
 class AgentInfo(BaseModel):
     """One subagent the server can invoke.
 
@@ -227,6 +258,25 @@ class AgentInfo(BaseModel):
             invocations=state.invocations,
         )
 
+    @classmethod
+    def from_name(cls, name: str) -> AgentInfo | None:
+        """Look one agent up by `id`. `None` when there is no such agent -- the route
+        turns that into a 404, so this stays free of HTTP concerns and is usable from
+        the CLI or a future websocket without dragging FastAPI in.
+
+        Exact match, no case folding and no fuzzy fallback: the name is the key the
+        manager invokes, and the SDK does not fold it either. Resolving 'Critic' here
+        would hand back an agent that `POST /v1/runs` cannot actually reach.
+        """
+        for entry_name, definition, availability in _roster_entries():
+            if entry_name != name:
+                continue
+            # Snapshot only once we know we are returning something. Same source as the
+            # list endpoint, so the two cannot report different statuses for one agent.
+            state = REGISTRY.snapshot().get(name, REGISTRY.default_state())
+            return cls.from_definition(entry_name, definition, availability, state)
+        return None
+
 
 class AgentsResponse(BaseModel):
     """Body of `GET /v1/agents`: the subagent roster.
@@ -248,13 +298,9 @@ class AgentsResponse(BaseModel):
     def from_rosters(cls) -> AgentsResponse:
         """Join the live rosters with live state, so neither half can drift.
 
-        The rosters are imported here, not at module scope: `agency.agents.*` pulls in
-        the SDK, and `agency.api` stays importable without it (`--help`, OpenAPI
-        generation). Same reason `deps.make_runner` defers its import.
+        Roster reading (and its deferred SDK import) lives in `_roster_entries()`, which
+        the single-agent route shares.
         """
-        from agency.agents.definitions import AGENTS
-        from agency.agents.team import TEAM
-
         # One snapshot for the whole response, not a lookup per agent: two agents in the
         # same body should describe the same instant, or a client watching a fan-out
         # sees a roster that never actually existed.
@@ -263,14 +309,9 @@ class AgentsResponse(BaseModel):
         # with the current time, so an agent that has never run would report a fresh
         # timestamp on every poll and look like it had just done something.
         unseen = REGISTRY.default_state()
-        rosters: tuple[tuple[dict[str, AgentDefinition], Availability], ...] = (
-            (AGENTS, "always"),
-            (TEAM, "team"),
-        )
         agents = [
-            AgentInfo.from_definition(name, roster[name], availability, states.get(name, unseen))
-            for roster, availability in rosters
-            for name in sorted(roster)
+            AgentInfo.from_definition(name, definition, availability, states.get(name, unseen))
+            for name, definition, availability in _roster_entries()
         ]
         return cls(agents=agents, count=len(agents))
 

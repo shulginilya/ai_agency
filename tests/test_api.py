@@ -249,6 +249,76 @@ async def test_agents_requires_a_key_when_one_is_configured(api_settings: Settin
         assert (await c.get("/v1/agents", headers={"X-API-Key": "s3cret"})).status_code == 200
 
 
+async def test_get_agent_returns_the_same_entry_as_the_list(client: httpx.AsyncClient) -> None:
+    listed = {a["name"]: a for a in (await client.get("/v1/agents")).json()["agents"]}
+    for name in list(AGENTS) + list(TEAM):
+        response = await client.get(f"/v1/agents/{name}")
+        assert response.status_code == 200
+        # Field for field, not just the name: two independent walks of the rosters are
+        # exactly what this endpoint must not become.
+        assert response.json() == listed[name]
+
+
+async def test_get_agent_reports_live_status(client: httpx.AsyncClient) -> None:
+    assert (await client.get("/v1/agents/reviewer")).json()["status"] == "idle"
+    REGISTRY.record_start("reviewer")
+    body = (await client.get("/v1/agents/reviewer")).json()
+    assert body["status"] == "running"
+    assert body["invocations"] == 1
+    # Stop first: `running` deliberately outranks `failed`, so a failure recorded while
+    # the agent is still active would (correctly) still read as running.
+    REGISTRY.record_stop("reviewer")
+    REGISTRY.record_failure("reviewer")
+    assert (await client.get("/v1/agents/reviewer")).json()["status"] == "error"
+
+
+async def test_unknown_agent_is_a_404_problem_document(client: httpx.AsyncClient) -> None:
+    response = await client.get("/v1/agents/nope")
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith(CONTENT_TYPE)
+    body = response.json()
+    assert body["type"].endswith("/not-found")
+    assert body["status"] == 404
+    assert "nope" in body["detail"]
+    assert body["instance"] == "/v1/agents/nope"
+    # The roster rides along so a stale pinned name is one response away from being fixed.
+    assert body["known"] == sorted(AGENTS) + sorted(TEAM)
+
+
+async def test_agent_lookup_is_exact(client: httpx.AsyncClient) -> None:
+    # Case folding here would resolve a name that POST /v1/runs cannot actually invoke,
+    # moving the failure from this endpoint to a run that dies mid-flight.
+    assert (await client.get("/v1/agents/Critic")).status_code == 404
+    assert (await client.get("/v1/agents/critic")).status_code == 200
+
+
+async def test_absurd_agent_id_is_rejected_before_the_lookup(client: httpx.AsyncClient) -> None:
+    # Bounded so a junk path segment cannot be echoed back at length in the error body.
+    assert (await client.get(f"/v1/agents/{'x' * 65}")).status_code == 422
+
+
+async def test_get_agent_never_exposes_a_system_prompt(client: httpx.AsyncClient) -> None:
+    response = await client.get("/v1/agents/reviewer")
+    assert "prompt" not in response.json()
+    assert "code review specialist" not in response.text
+
+
+async def test_get_agent_does_not_touch_the_runner(client: httpx.AsyncClient) -> None:
+    await client.get("/v1/agents/critic")
+    assert client.runner.calls == []  # type: ignore[attr-defined]
+
+
+async def test_get_agent_requires_a_key_when_one_is_configured(api_settings: Settings) -> None:
+    secured = api_settings.model_copy(update={"api_key": "s3cret"})
+    async with make_client(secured, FakeRunner()) as c:
+        assert (await c.get("/v1/agents/critic")).status_code == 401
+        # Auth before existence: an unauthenticated caller must not be able to probe
+        # which agent names are real.
+        assert (await c.get("/v1/agents/nope")).status_code == 401
+        keyed = {"X-API-Key": "s3cret"}
+        assert (await c.get("/v1/agents/critic", headers=keyed)).status_code == 200
+
+
 # --- validation ----------------------------------------------------------------------
 
 
