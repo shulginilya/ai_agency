@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from agency.api.deps import SettingsDep, SlotsDep
+from agency.api.deps import SessionsDep, SettingsDep, SlotsDep
 from agency.api.schemas import Health, Readiness
 from agency.api.version import VERSION
 
@@ -28,7 +28,7 @@ async def healthz() -> Health:
 
 
 @router.get("/readyz", response_model=Readiness, summary="Readiness probe")
-async def readyz(settings: SettingsDep, slots: SlotsDep) -> Readiness:
+async def readyz(settings: SettingsDep, slots: SlotsDep, sessions: SessionsDep) -> Readiness:
     checks: dict[str, str] = {}
 
     for name, path in (
@@ -53,5 +53,12 @@ async def readyz(settings: SettingsDep, slots: SlotsDep) -> Readiness:
     return Readiness(
         status=status,  # type: ignore[arg-type]
         checks=checks,
-        capacity={"limit": slots.limit, "in_flight": slots.in_flight},
+        capacity={
+            "limit": slots.limit,
+            "in_flight": slots.in_flight,
+            # Sessions are held open between requests, so "how many are parked here" is
+            # the number an operator needs before draining or restarting this instance.
+            "session_limit": sessions.limit,
+            "sessions_open": sessions.count,
+        },
     )

@@ -1,10 +1,15 @@
 """Dependency injection: the seams.
 
-Three things live here, and each exists so that something can be swapped or bounded
-without editing a route:
+Everything here exists so that something can be swapped or bounded without editing a
+route:
 
 - `get_runner` is the seam between HTTP and the agent loop. Tests override it and the
   suite never spends a cent. Nothing in `routers/` imports `agency.runner` directly.
+- `make_conversation_factory` is the same seam for multi-turn sessions: one prompt at a
+  time against a *retained* context. It sits next to `make_runner` because these two
+  functions are the only places in `api/` that touch `agency.runner`, and keeping them
+  adjacent is what makes that easy to keep true. The state they feed lives in
+  `api/sessions.py`.
 - `require_api_key` is the auth seam, a no-op until a key is configured.
 - `RunSlots` bounds concurrency, because an agent run is not a normal request.
 """
@@ -16,12 +21,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from secrets import compare_digest
-from typing import Annotated, Protocol
+from typing import Annotated, Any, Protocol
 
 from fastapi import Depends, Request
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 from agency.api.errors import Overloaded, Unauthorized
+from agency.api.sessions import Conversation, ConversationFactory, SessionStore
 from agency.config import Profile, Settings
 from agency.obs.cost import RunRecord
 from agency.obs.logging import get_logger
@@ -66,6 +72,51 @@ def make_runner(settings: Settings, project_root: Path) -> Runner:
         )
 
     return _run
+
+
+class _AgentConversation:
+    """Adapts `runner.Agent` to the `Conversation` protocol.
+
+    `Agent` is an async context manager, but a session's lifetime is not a request's --
+    it spans the many requests of a conversation -- so the manager is entered and exited
+    by hand here. `SessionStore` is what guarantees the exit happens: every path out of
+    a session (`DELETE`, a failed turn, the idle reaper, shutdown) goes through
+    `SessionStore.close`, which calls `aclose` exactly once.
+    """
+
+    def __init__(self, agent: Any) -> None:
+        self._agent = agent
+
+    async def send(self, prompt: str) -> RunRecord:
+        record: RunRecord = await self._agent.ask(prompt)
+        return record
+
+    async def aclose(self) -> None:
+        await self._agent.__aexit__(None, None, None)
+
+
+def make_conversation_factory(settings: Settings, project_root: Path) -> ConversationFactory:
+    """The production `ConversationFactory`: a connected `runner.Agent` per session.
+
+    Same deferred import as `make_runner`, and for the same reason -- `agency.api` must
+    stay importable without the SDK. Note what is *not* here: no `ClaudeAgentOptions`.
+    `Agent.__aenter__` calls `options.build_options`, so a session is configured through
+    the same chokepoint as a CLI run, and pinning a profile per session is the only knob
+    the HTTP layer gets.
+    """
+    from agency.runner import Agent
+
+    async def _open(*, profile: Profile, team: bool = False) -> Conversation:
+        agent = Agent(
+            profile=profile,
+            settings=settings,
+            project_root=project_root,
+            team=team,
+        )
+        await agent.__aenter__()
+        return _AgentConversation(agent)
+
+    return _open
 
 
 class RunSlots:
@@ -143,6 +194,11 @@ def get_slots(request: Request) -> RunSlots:
     return slots
 
 
+def get_sessions(request: Request) -> SessionStore:
+    sessions: SessionStore = request.app.state.sessions
+    return sessions
+
+
 async def require_api_key(
     settings: Annotated[Settings, Depends(get_settings_dep)],
     api_key: Annotated[str | None, Depends(_api_key_scheme)] = None,
@@ -170,17 +226,21 @@ async def require_api_key(
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
 RunnerDep = Annotated[Runner, Depends(get_runner)]
 SlotsDep = Annotated[RunSlots, Depends(get_slots)]
+SessionsDep = Annotated[SessionStore, Depends(get_sessions)]
 
 __all__ = [
     "API_KEY_HEADER",
     "Runner",
     "RunSlots",
     "RunnerDep",
+    "SessionsDep",
     "SettingsDep",
     "SlotsDep",
     "get_runner",
+    "get_sessions",
     "get_settings_dep",
     "get_slots",
+    "make_conversation_factory",
     "make_runner",
     "require_api_key",
 ]

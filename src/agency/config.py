@@ -77,6 +77,19 @@ class Settings(BaseSettings):
     api_run_timeout_s: float = 300.0
     api_queue_timeout_s: float = 0.0
 
+    # A multi-turn session (POST /v1/sessions) holds an SDK subprocess open *between*
+    # requests, so it is a longer-lived and more expensive thing than a run. The cap is
+    # therefore on open sessions, not on in-flight work -- `api_max_concurrent_runs`
+    # still bounds the turns themselves, which is what actually costs money.
+    api_max_sessions: int = 8
+
+    # Idle seconds before a session is reaped. A client that crashes mid-conversation
+    # never sends its DELETE, and the alternative to a TTL is a subprocess that lives
+    # until the container restarts. 0 disables reaping -- only sane if every client is
+    # trusted to close what it opens. Reaping is lazy (see api/sessions.py), so this is
+    # a floor on a session's lifetime, not a ceiling.
+    api_session_idle_ttl_s: float = 900.0
+
     # Swagger/ReDoc/openapi.json. Turn off in production.
     api_docs_enabled: bool = True
 
