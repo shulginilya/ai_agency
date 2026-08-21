@@ -24,6 +24,7 @@ from agency.agents.team import TEAM
 from agency.api.app import create_app
 from agency.api.deps import get_runner, get_slots
 from agency.api.errors import CONTENT_TYPE
+from agency.api.sessions import Conversation
 from agency.config import Profile, Settings
 from agency.obs.agent_state import REGISTRY
 from agency.obs.cost import RunRecord, ToolCall
@@ -59,13 +60,63 @@ class FakeRunner:
         return self.record
 
 
+class FakeConversation:
+    """Stands in for a connected `runner.Agent`.
+
+    Keeps its own turn counter and prompt log, which is what makes "the context was
+    retained" assertable without a model: if two messages reach the *same* object, the
+    session held its conversation open, and if they do not, it did not.
+    """
+
+    def __init__(self, profile: Profile, team: bool, delay: float = 0.0, boom: str = "") -> None:
+        self.profile = profile
+        self.team = team
+        self.delay = delay
+        self.boom = boom
+        self.prompts: list[str] = []
+        self.closed = 0
+
+    async def send(self, prompt: str) -> RunRecord:
+        self.prompts.append(prompt)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.boom:
+            raise RuntimeError(self.boom)
+        return _finished_record(run_id=f"turn{len(self.prompts)}", prompt=prompt)
+
+    async def aclose(self) -> None:
+        # Counted, not flagged: a store that closed a session twice would leak nothing
+        # but would mean `close` is running on a path nobody reasoned about.
+        self.closed += 1
+
+
+class FakeConversations:
+    """Stands in for `deps.make_conversation_factory`. Records what was opened."""
+
+    def __init__(self, delay: float = 0.0, boom: str = "") -> None:
+        self.delay = delay
+        self.boom = boom
+        self.opened: list[FakeConversation] = []
+
+    async def __call__(self, *, profile: Profile, team: bool = False) -> Conversation:
+        conversation = FakeConversation(profile, team, delay=self.delay, boom=self.boom)
+        self.opened.append(conversation)
+        return conversation
+
+
 @pytest.fixture
 def api_settings(settings: Settings) -> Settings:
     return settings.model_copy(update={"api_run_timeout_s": 5.0, "api_docs_enabled": True})
 
 
-def make_client(settings: Settings, runner: Any) -> httpx.AsyncClient:
-    app = create_app(settings, runner=runner)
+def make_client(
+    settings: Settings, runner: Any, conversations: Any | None = None
+) -> httpx.AsyncClient:
+    app = create_app(
+        settings,
+        runner=runner,
+        conversation_factory=conversations or FakeConversations(),
+    )
     # dependency_overrides as well as the constructor argument: the constructor covers
     # production wiring, the override proves the seam works for anyone extending this.
     app.dependency_overrides[get_runner] = lambda: runner
@@ -76,8 +127,10 @@ def make_client(settings: Settings, runner: Any) -> httpx.AsyncClient:
 @pytest.fixture
 async def client(api_settings: Settings) -> AsyncIterator[httpx.AsyncClient]:
     runner = FakeRunner()
-    async with make_client(api_settings, runner) as c:
+    conversations = FakeConversations()
+    async with make_client(api_settings, runner, conversations) as c:
         c.runner = runner  # type: ignore[attr-defined]
+        c.conversations = conversations  # type: ignore[attr-defined]
         yield c
 
 
@@ -317,6 +370,300 @@ async def test_get_agent_requires_a_key_when_one_is_configured(api_settings: Set
         assert (await c.get("/v1/agents/nope")).status_code == 401
         keyed = {"X-API-Key": "s3cret"}
         assert (await c.get("/v1/agents/critic", headers=keyed)).status_code == 200
+
+
+# --- sessions ------------------------------------------------------------------------
+# A session is the only resource here that outlives a request: it holds an SDK
+# subprocess open between calls. So these tests are less about the mapping and more
+# about the lifecycle -- who closes it, what happens when nobody does, and which
+# failures leave it usable.
+
+
+async def _open(client: httpx.AsyncClient, **body: Any) -> dict[str, Any]:
+    response = await client.post("/v1/sessions", json=body)
+    assert response.status_code == 201, response.text
+    return dict(response.json())
+
+
+async def test_opening_a_session_returns_a_handle(client: httpx.AsyncClient) -> None:
+    body = await _open(client)
+    assert body["id"]
+    assert body["status"] == "idle"
+    assert body["turns"] == 0
+    # The server's own profile, resolved here rather than reported as null -- a client
+    # must be able to see what it is actually talking to.
+    assert body["profile"] == "sandboxed"
+    assert body["expires_at"] is not None
+
+
+async def test_session_options_are_pinned_at_open_time(client: httpx.AsyncClient) -> None:
+    body = await _open(client, profile="eval", team=True)
+    conversation = client.conversations.opened[-1]  # type: ignore[attr-defined]
+    assert (body["profile"], body["team"]) == ("eval", True)
+    assert (conversation.profile, conversation.team) == ("eval", True)
+
+
+async def test_a_message_returns_the_mapped_turn(client: httpx.AsyncClient) -> None:
+    session = await _open(client)
+    response = await client.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "hi"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["session_id"] == session["id"]
+    assert body["turn"] == 1
+    # `run` is the same object POST /v1/runs returns, so a client renders both the same
+    # way. Nesting it is what keeps that true as either side grows fields.
+    assert body["run"]["run_id"] == "turn1"
+    assert body["run"]["tools_used"] == ["Read", "Agent"]
+    assert body["run"]["delegated_to"] == ["reviewer"]
+
+
+async def test_turns_share_one_retained_conversation(client: httpx.AsyncClient) -> None:
+    # The entire point of the endpoint. Two messages must reach the same live agent --
+    # a per-request agent would answer turn two with no memory of turn one, which is
+    # exactly what POST /v1/runs already does.
+    session = await _open(client)
+    for prompt in ("first", "second"):
+        await client.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": prompt})
+
+    assert len(client.conversations.opened) == 1  # type: ignore[attr-defined]
+    assert client.conversations.opened[0].prompts == ["first", "second"]  # type: ignore[attr-defined]
+    body = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert body["turns"] == 2
+
+
+async def test_a_message_may_not_smuggle_run_options(client: httpx.AsyncClient) -> None:
+    # 422, not a silent no-op: profile and team were baked into the options this session
+    # connected with, so accepting them here would tell the caller they had switched
+    # profile mid-conversation when they had not.
+    session = await _open(client)
+    for body in ({"prompt": "x", "profile": "eval"}, {"prompt": "x", "team": True}):
+        response = await client.post(f"/v1/sessions/{session['id']}/messages", json=body)
+        assert response.status_code == 422
+
+
+async def test_a_second_message_while_one_is_in_flight_is_409(api_settings: Settings) -> None:
+    # Refused, not queued: two overlapping turns on one SDK client interleave into a
+    # single conversation, and the second caller drains the first one\'s response.
+    conversations = FakeConversations(delay=0.2)
+    async with make_client(api_settings, FakeRunner(), conversations) as c:
+        session = await _open(c)
+        url = f"/v1/sessions/{session['id']}/messages"
+        first = asyncio.create_task(c.post(url, json={"prompt": "slow"}))
+        await asyncio.sleep(0.05)
+        assert (await c.get(f"/v1/sessions/{session['id']}")).json()["status"] == "busy"
+        second = await c.post(url, json={"prompt": "impatient"})
+        assert (await first).status_code == 200
+
+    assert second.status_code == 409
+    assert second.json()["type"].endswith("/session-busy")
+    # And the refusal never reached the agent.
+    assert conversations.opened[0].prompts == ["slow"]
+
+
+async def test_closing_a_session_releases_the_conversation(client: httpx.AsyncClient) -> None:
+    session = await _open(client)
+    assert (await client.delete(f"/v1/sessions/{session['id']}")).status_code == 204
+    assert client.conversations.opened[0].closed == 1  # type: ignore[attr-defined]
+    # The handle is dead, and says so rather than 204-ing again.
+    assert (await client.get(f"/v1/sessions/{session['id']}")).status_code == 404
+    assert (await client.delete(f"/v1/sessions/{session['id']}")).status_code == 404
+
+
+async def test_closing_a_busy_session_is_refused(api_settings: Settings) -> None:
+    # Tearing the client out mid-turn would surface to the other caller as an
+    # unexplainable 502. The turn has its own timeout, so the wait is bounded.
+    conversations = FakeConversations(delay=0.2)
+    async with make_client(api_settings, FakeRunner(), conversations) as c:
+        session = await _open(c)
+        turn = asyncio.create_task(
+            c.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "slow"})
+        )
+        await asyncio.sleep(0.05)
+        refused = await c.delete(f"/v1/sessions/{session['id']}")
+        assert (await turn).status_code == 200
+        assert refused.status_code == 409
+        assert conversations.opened[0].closed == 0
+        # Once it is idle again the close goes through.
+        assert (await c.delete(f"/v1/sessions/{session['id']}")).status_code == 204
+
+
+async def test_unknown_session_is_a_404_problem_document(client: httpx.AsyncClient) -> None:
+    response = await client.post("/v1/sessions/nope/messages", json={"prompt": "x"})
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith(CONTENT_TYPE)
+    body = response.json()
+    assert body["type"].endswith("/not-found")
+    # The detail names expiry, because that is the likeliest reason a handle the client
+    # definitely received has stopped working.
+    assert "expired" in body["detail"]
+
+
+async def test_absurd_session_id_is_rejected_before_the_lookup(client: httpx.AsyncClient) -> None:
+    assert (await client.get(f"/v1/sessions/{'x' * 65}")).status_code == 422
+
+
+async def test_the_session_cap_refuses_with_503(api_settings: Settings) -> None:
+    bounded = api_settings.model_copy(update={"api_max_sessions": 1})
+    conversations = FakeConversations()
+    async with make_client(bounded, FakeRunner(), conversations) as c:
+        await _open(c)
+        refused = await c.post("/v1/sessions", json={})
+        assert refused.status_code == 503
+        assert refused.headers["retry-after"] == "5"
+        assert refused.json()["type"].endswith("/overloaded")
+        # Nothing was connected for the refused request -- the cap is checked first, or
+        # it would be a cap on *reported* sessions rather than on subprocesses.
+        assert len(conversations.opened) == 1
+
+
+async def test_an_idle_session_is_reaped(api_settings: Settings) -> None:
+    brief = api_settings.model_copy(update={"api_session_idle_ttl_s": 0.05})
+    conversations = FakeConversations()
+    async with make_client(brief, FakeRunner(), conversations) as c:
+        session = await _open(c)
+        await asyncio.sleep(0.1)
+        # Reaping is lazy: this request is what triggers it. A client that crashed
+        # mid-conversation never sends its DELETE, and the subprocess would otherwise
+        # live until the container restarts.
+        assert (await c.get(f"/v1/sessions/{session['id']}")).status_code == 404
+        assert conversations.opened[0].closed == 1
+        assert (await c.get("/v1/sessions")).json()["count"] == 0
+
+
+async def test_the_ttl_can_be_disabled(api_settings: Settings) -> None:
+    forever = api_settings.model_copy(update={"api_session_idle_ttl_s": 0.0})
+    async with make_client(forever, FakeRunner()) as c:
+        session = await _open(c)
+        assert session["expires_at"] is None
+        await asyncio.sleep(0.05)
+        assert (await c.get(f"/v1/sessions/{session['id']}")).status_code == 200
+
+
+async def test_a_timed_out_turn_closes_the_session(api_settings: Settings) -> None:
+    # The turn is cancelled mid-drain, which leaves the SDK client connected but its
+    # response stream half-consumed. Reusing that would produce a wrong answer rather
+    # than an error, so the session goes with it -- and the body says so.
+    impatient = api_settings.model_copy(update={"api_run_timeout_s": 0.05})
+    conversations = FakeConversations(delay=5.0)
+    async with make_client(impatient, FakeRunner(), conversations) as c:
+        session = await _open(c)
+        response = await c.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "x"})
+        assert response.status_code == 504
+        assert response.json()["type"].endswith("/run-timeout")
+        assert "closed" in response.json()["detail"]
+        assert conversations.opened[0].closed == 1
+        assert (await c.get(f"/v1/sessions/{session['id']}")).status_code == 404
+
+
+async def test_a_failed_turn_closes_the_session_without_leaking_internals(
+    api_settings: Settings,
+) -> None:
+    conversations = FakeConversations(boom="ANTHROPIC_API_KEY=sk-secret is invalid")
+    async with make_client(api_settings, FakeRunner(), conversations) as c:
+        session = await _open(c)
+        response = await c.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "x"})
+        assert response.status_code == 502
+        assert "sk-secret" not in response.text
+        assert "RuntimeError" in response.json()["detail"]
+        assert conversations.opened[0].closed == 1
+        assert (await c.get(f"/v1/sessions/{session['id']}")).status_code == 404
+
+
+async def test_a_turn_takes_a_run_slot(api_settings: Settings) -> None:
+    # Sessions must not be a way around the run cap: an open session is idle weight, but
+    # a running turn costs exactly what a POST /v1/runs costs.
+    bounded = api_settings.model_copy(update={"api_max_concurrent_runs": 1})
+    conversations = FakeConversations(delay=0.2)
+    async with make_client(bounded, FakeRunner(), conversations) as c:
+        session = await _open(c)
+        turn = asyncio.create_task(
+            c.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "slow"})
+        )
+        await asyncio.sleep(0.05)
+        run = await c.post("/v1/runs", json={"prompt": "queued"})
+        assert (await turn).status_code == 200
+    assert run.status_code == 503
+
+
+async def test_a_saturated_run_pool_does_not_kill_the_session(api_settings: Settings) -> None:
+    # The load-bearing half of the "close a broken session" rule: a 503 means the turn
+    # never ran, so the conversation is untouched. Closing it here would turn a
+    # retryable refusal into permanent loss of the context.
+    bounded = api_settings.model_copy(update={"api_max_concurrent_runs": 1})
+    runner = FakeRunner(delay=0.2)
+    conversations = FakeConversations()
+    async with make_client(bounded, runner, conversations) as c:
+        session = await _open(c)
+        occupied = asyncio.create_task(c.post("/v1/runs", json={"prompt": "slow"}))
+        await asyncio.sleep(0.05)
+        refused = await c.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "x"})
+        assert refused.status_code == 503
+        assert (await occupied).status_code == 200
+
+        assert conversations.opened[0].closed == 0
+        retried = await c.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "x"})
+        assert retried.status_code == 200
+        assert retried.json()["turn"] == 1
+
+
+async def test_listing_sessions_tracks_the_lifecycle(client: httpx.AsyncClient) -> None:
+    assert (await client.get("/v1/sessions")).json() == {"sessions": [], "count": 0}
+    first = await _open(client)
+    second = await _open(client)
+    body = (await client.get("/v1/sessions")).json()
+    assert [s["id"] for s in body["sessions"]] == [first["id"], second["id"]]
+    assert body["count"] == 2
+
+    await client.delete(f"/v1/sessions/{first['id']}")
+    body = (await client.get("/v1/sessions")).json()
+    assert [s["id"] for s in body["sessions"]] == [second["id"]]
+
+
+async def test_readyz_reports_session_capacity(client: httpx.AsyncClient) -> None:
+    await _open(client)
+    capacity = (await client.get("/readyz")).json()["capacity"]
+    assert capacity["sessions_open"] == 1
+    assert capacity["session_limit"] >= 1
+
+
+async def test_sessions_never_touch_the_one_shot_runner(client: httpx.AsyncClient) -> None:
+    # Two seams, not one. A session that fell back to `run_once` would silently lose the
+    # retained context -- and would still pass every mapping assertion above.
+    session = await _open(client)
+    await client.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "x"})
+    assert client.runner.calls == []  # type: ignore[attr-defined]
+
+
+async def test_session_routes_require_a_key_when_one_is_configured(
+    api_settings: Settings,
+) -> None:
+    secured = api_settings.model_copy(update={"api_key": "s3cret"})
+    keyed = {"X-API-Key": "s3cret"}
+    async with make_client(secured, FakeRunner()) as c:
+        assert (await c.post("/v1/sessions", json={})).status_code == 401
+        assert (await c.get("/v1/sessions")).status_code == 401
+        # Auth before existence: an unauthenticated caller must not be able to probe
+        # which session ids are live.
+        assert (await c.get("/v1/sessions/whatever")).status_code == 401
+        assert (await c.delete("/v1/sessions/whatever")).status_code == 401
+        assert (
+            await c.post("/v1/sessions/whatever/messages", json={"prompt": "x"})
+        ).status_code == 401
+
+        opened = await c.post("/v1/sessions", json={}, headers=keyed)
+        assert opened.status_code == 201
+        session_id = opened.json()["id"]
+        sent = await c.post(
+            f"/v1/sessions/{session_id}/messages", json={"prompt": "x"}, headers=keyed
+        )
+        assert sent.status_code == 200
+
+
+async def test_openapi_documents_the_session_contract(client: httpx.AsyncClient) -> None:
+    paths = (await client.get("/openapi.json")).json()["paths"]
+    assert "409" in paths["/v1/sessions/{session_id}/messages"]["post"]["responses"]
+    assert "503" in paths["/v1/sessions"]["post"]["responses"]
+    assert "delete" in paths["/v1/sessions/{session_id}"]
 
 
 # --- validation ----------------------------------------------------------------------

@@ -64,6 +64,19 @@ class NotFound(APIError):
     slug = "not-found"
 
 
+class SessionBusy(APIError):
+    """A second message arrived while the session's previous turn was still running.
+
+    409 rather than 503: this is not capacity, it is a state conflict on one resource,
+    and the fix is on the caller's side (wait for the response they already asked for)
+    rather than "retry shortly". See `api/sessions.py` for why the turn is not queued.
+    """
+
+    status_code = 409
+    title = "Session Busy"
+    slug = "session-busy"
+
+
 class ValidationFailed(APIError):
     status_code = 422
     title = "Validation Failed"

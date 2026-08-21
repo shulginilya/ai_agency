@@ -20,10 +20,17 @@ from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.routing import BaseRoute
 
-from agency.api.deps import API_KEY_HEADER, Runner, RunSlots, make_runner
+from agency.api.deps import (
+    API_KEY_HEADER,
+    Runner,
+    RunSlots,
+    make_conversation_factory,
+    make_runner,
+)
 from agency.api.errors import ProblemFallbackMiddleware, install_error_handlers
 from agency.api.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
-from agency.api.routers import agents, health, runs
+from agency.api.routers import agents, health, runs, sessions
+from agency.api.sessions import ConversationFactory, SessionStore
 from agency.api.version import API_VERSION, VERSION
 from agency.config import Settings, get_settings
 from agency.obs.logging import configure_logging, get_logger
@@ -43,6 +50,13 @@ TAGS: list[dict[str, Any]] = [
     {"name": "health", "description": "Liveness and readiness probes. Never authenticated."},
     {"name": "runs", "description": "Execute agent runs."},
     {"name": "agents", "description": "Agent discovery: which subagents this server can invoke."},
+    {
+        "name": "sessions",
+        "description": (
+            "Multi-turn conversations. A session holds a live agent context open across "
+            "requests; close it when you are done, or it is reaped when idle."
+        ),
+    },
 ]
 
 
@@ -50,13 +64,16 @@ def create_app(
     settings: Settings | None = None,
     *,
     runner: Runner | None = None,
+    conversation_factory: ConversationFactory | None = None,
     project_root: Path | None = None,
 ) -> FastAPI:
     """Build the ASGI app.
 
-    `runner` is the injection point for tests: pass a fake and the suite exercises the
-    whole HTTP stack -- auth, validation, admission control, error mapping -- without
-    starting a model session or spending anything.
+    `runner` and `conversation_factory` are the injection points for tests: pass fakes
+    and the suite exercises the whole HTTP stack -- auth, validation, admission control,
+    session lifecycle, error mapping -- without starting a model session or spending
+    anything. They are two seams rather than one because a one-shot run and a retained
+    conversation are genuinely different objects; see `api/sessions.py`.
     """
     settings = settings or get_settings()
     root = project_root or Path.cwd()
@@ -76,12 +93,23 @@ def create_app(
             auth="api-key" if settings.api_key else "open",
             max_concurrent_runs=settings.api_max_concurrent_runs,
             run_timeout_s=settings.api_run_timeout_s,
+            max_sessions=settings.api_max_sessions,
+            session_idle_ttl_s=settings.api_session_idle_ttl_s,
             docs=settings.api_docs_enabled,
         )
         try:
             yield
         finally:
-            log.info("api.shutdown", in_flight=app.state.slots.in_flight)
+            # Sessions are the only state that outlives a request, and each one is a
+            # subprocess. Closing them here is what stops a `docker stop` from leaving
+            # orphans behind. (Not reachable under httpx.ASGITransport, which never runs
+            # lifespan events -- tests drive `SessionStore` directly instead.)
+            await app.state.sessions.aclose_all()
+            log.info(
+                "api.shutdown",
+                in_flight=app.state.slots.in_flight,
+                sessions_closed=app.state.sessions.count,
+            )
 
     docs_on = settings.api_docs_enabled
     app = FastAPI(
@@ -106,19 +134,31 @@ def create_app(
         limit=settings.api_max_concurrent_runs,
         queue_timeout_s=settings.api_queue_timeout_s,
     )
+    app.state.sessions = SessionStore(
+        conversation_factory or make_conversation_factory(settings, root),
+        limit=settings.api_max_sessions,
+        idle_ttl_s=settings.api_session_idle_ttl_s,
+    )
 
     install_error_handlers(app)
 
     app.include_router(health.router)
     app.include_router(runs.router, prefix=f"/{API_VERSION}")
     app.include_router(agents.router, prefix=f"/{API_VERSION}")
+    app.include_router(sessions.router, prefix=f"/{API_VERSION}")
 
     # `add_middleware` prepends, so the LAST one added is the outermost and runs first.
     # Added innermost-first below, which reads backwards but puts each layer where it has
     # to be: the fallback inside CORS (so a 500 still gets CORS headers), CORS inside the
     # request-id layer (so every response, including a preflight, is logged and tagged).
     app.add_middleware(ProblemFallbackMiddleware)
-    _install_cors(app, settings, _allowed_methods(health.router, runs.router, agents.router))
+    _install_cors(
+        app,
+        settings,
+        # sessions.router is what puts DELETE in this list -- the exact case the
+        # docstring below warns about.
+        _allowed_methods(health.router, runs.router, agents.router, sessions.router),
+    )
     app.add_middleware(RequestContextMiddleware)
 
     return app

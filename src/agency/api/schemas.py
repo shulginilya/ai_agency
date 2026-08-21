@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agency.api.sessions import Session
 from agency.config import Profile
 from agency.hooks.delegation import delegations
 from agency.obs.agent_state import REGISTRY, AgentState
@@ -89,6 +90,121 @@ class RunResponse(BaseModel):
                 for c in record.tool_calls
             ],
             summary=record.summary(),
+        )
+
+
+class SessionCreateRequest(BaseModel):
+    """Body of `POST /v1/sessions`. Every field is optional: the server's own profile
+    and a solo (non-team) agent are the defaults, same as `POST /v1/runs`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile: Profile | None = Field(
+        default=None,
+        description="Pin the profile for the whole session. Fixed at open time.",
+    )
+    team: bool = Field(
+        default=False,
+        description=(
+            "Open the session as the manager agent, which may delegate to the workers "
+            "in agents/team.py. Fixed at open time."
+        ),
+    )
+
+
+class MessageRequest(BaseModel):
+    """Body of `POST /v1/sessions/{session_id}/messages`.
+
+    Only a prompt. `profile` and `team` are absent on purpose and, because of
+    `extra="forbid"`, sending either is a 422 rather than a silent no-op: they were
+    baked into the `ClaudeAgentOptions` this session connected with, so there is no
+    honest way to honour them mid-conversation. Open a new session instead.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: Prompt = Field(description="The next turn of the conversation.")
+
+
+SessionStatus = Literal["idle", "busy"]
+
+
+class SessionInfo(BaseModel):
+    """One open session. Deliberately not the conversation itself: the transcript is not
+    stored here (each turn is persisted as its own run record, keyed by `run_id`), and
+    the SDK client behind it is not something a client can be handed a view of."""
+
+    id: str = Field(description="Opaque handle. Mint it here; do not construct one.")
+    profile: str = Field(description="Profile the session connected with. Fixed for its life.")
+    team: bool = Field(description="Whether this session runs the manager agent.")
+    status: SessionStatus = Field(
+        description=(
+            "'busy' while a turn is in flight. A message sent to a busy session is a "
+            "409, not a queued turn."
+        )
+    )
+    turns: int = Field(description="Messages completed in this session so far.")
+    created_at: datetime
+    last_active_at: datetime = Field(
+        description="When the last turn finished. What the idle TTL is measured from."
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When the server may reap this session for idleness. Null when the TTL is "
+            "disabled. A floor, not a promise: reaping happens on request, so a session "
+            "may outlive it on an idle server."
+        ),
+    )
+
+    @classmethod
+    def from_session(cls, session: Session) -> SessionInfo:
+        return cls(
+            id=session.id,
+            profile=session.profile,
+            team=session.team,
+            status="busy" if session.busy else "idle",
+            turns=session.turns,
+            created_at=session.created_at,
+            last_active_at=session.last_active_at,
+            expires_at=session.expires_at,
+        )
+
+
+class SessionsResponse(BaseModel):
+    """Body of `GET /v1/sessions`. An envelope for the same reason `AgentsResponse` is
+    one: a bare array cannot grow a field."""
+
+    sessions: list[SessionInfo]
+    count: int = Field(description="Length of `sessions`.")
+
+    @classmethod
+    def from_sessions(cls, sessions: list[Session]) -> SessionsResponse:
+        infos = [SessionInfo.from_session(s) for s in sessions]
+        return cls(sessions=infos, count=len(infos))
+
+
+class MessageResponse(BaseModel):
+    """Result of one turn.
+
+    The turn's result is nested as `run` rather than flattened alongside `session_id`,
+    so it is the *same* object `POST /v1/runs` returns -- a client can render a turn and
+    a one-shot run with one code path, and a field added to `RunResponse` cannot collide
+    with a session field.
+    """
+
+    session_id: str
+    turn: int = Field(
+        description="1-based index of this turn within the session. `run.run_id` is per-turn."
+    )
+    run: RunResponse
+
+    @classmethod
+    def from_record(cls, session: Session, record: RunRecord) -> MessageResponse:
+        return cls(
+            session_id=session.id,
+            turn=session.turns,
+            run=RunResponse.from_record(record),
         )
 
 

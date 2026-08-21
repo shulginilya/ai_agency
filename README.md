@@ -83,6 +83,9 @@ suite still install into an image with no web dependencies.
 | `GET /healthz` | Liveness. No dependencies, no auth — a failure means *restart me* |
 | `GET /readyz` | Readiness. Workspace writable, run dir writable, capacity |
 | `POST /v1/runs` | Run one prompt to completion. Returns the run record |
+| `POST /v1/sessions` | Open a multi-turn conversation. Returns a session handle |
+| `POST /v1/sessions/{id}/messages` | Send one turn into that retained context |
+| `DELETE /v1/sessions/{id}` | Close it. `GET /v1/sessions` lists what is open |
 
 **Shape worth copying.** Every endpoint goes: validate (`schemas.py`) → authorise
 (`require_api_key`) → admit (`RunSlots`) → bound (timeout) → delegate (the `Runner`
@@ -104,6 +107,36 @@ a thin adapter over the same path the CLI exercises.
   billing after the client has given up.
 - **The `Runner` protocol is the test seam.** `tests/test_api.py` drives the real ASGI
   app with a fake runner: real routing, real middleware, real error handlers, zero cost.
+
+### Conversations
+
+`POST /v1/runs` is one prompt against a fresh context. A session keeps the context open
+*between* requests, which is the only way turn three can say "now do the same for the
+other file" and mean it — resending the transcript is not equivalent, because the model
+would re-read every tool result instead of recalling that it already ran them.
+
+```bash
+SID=$(curl -s localhost:8000/v1/sessions -H 'content-type: application/json' -d '{}' | jq -r .id)
+curl -s localhost:8000/v1/sessions/$SID/messages -H 'content-type: application/json' \
+     -d '{"prompt":"Summarise README.md."}'
+curl -s localhost:8000/v1/sessions/$SID/messages -H 'content-type: application/json' \
+     -d '{"prompt":"Now do the same for AGENTIC_PLAN.md."}'
+curl -s -X DELETE localhost:8000/v1/sessions/$SID
+```
+
+An open session is a live SDK subprocess, not a row someone forgot to delete. So it is
+capped (`AGENCY_API_MAX_SESSIONS`, a 503 past it), reaped when idle
+(`AGENCY_API_SESSION_IDLE_TTL_S`, because a client that crashes never sends its
+`DELETE`), and serialised: a second message while one is in flight is a **409**, not a
+queued turn, since two overlapping turns on one SDK client interleave into a single
+conversation. Turns also take a `RunSlots` slot, so sessions are not a way around
+`AGENCY_API_MAX_CONCURRENT_RUNS`.
+
+`profile` and `team` are pinned when the session opens — sending either with a message is
+a 422 rather than a silent no-op, because they were baked into the options it connected
+with. A turn that times out or fails takes the session with it (the 504/502 body says
+so): a cancelled drain leaves the context half-written, and reusing it would produce a
+wrong answer rather than an error.
 
 ### Calling it from a browser
 

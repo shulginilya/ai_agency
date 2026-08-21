@@ -33,7 +33,11 @@ Nothing under `api/` may import `agency.runner` directly or construct
                      State is assembled in the factory, not the lifespan, because
                      `httpx.ASGITransport` never runs lifespan events — build it there
                      and the entire test suite exercises an app missing its deps.
-- `api/deps.py`    — the seams: `Runner` protocol, `require_api_key`, `RunSlots`
+- `api/deps.py`    — the seams: `Runner` protocol, `require_api_key`, `RunSlots`,
+                     `make_conversation_factory` (the only other binding to `runner`)
+- `api/sessions.py`— live multi-turn sessions: the `Conversation` protocol and
+                     `SessionStore` (cap, idle TTL, one-turn-at-a-time lock). State and
+                     lifecycle only; `routers/sessions.py` is the mapping to HTTP
 - `api/errors.py`  — `APIError` subclasses → RFC 9457 `application/problem+json`
 - `api/schemas.py` — wire contracts, versioned with the route prefix and deliberately
                      separate from `RunRecord` so internal accounting can change
@@ -47,6 +51,9 @@ Conventions:
   place, not at every raise site.
 - Request models set `extra="forbid"`. A silently ignored field means a caller believes
   they pinned a profile and quietly gets the server default.
+- A session holds a subprocess open *between* requests, so anything that can leave one
+  unclosed is a leak: every exit path (`DELETE`, failed turn, idle reaper, shutdown) goes
+  through `SessionStore.close`. Refuse (409/503) rather than queue.
 - An agent that errored is a **200 with `is_error=True`**. 5xx means the harness failed,
   not the model. Collapsing the two leaves clients unable to tell them apart.
 - Tests override the `Runner` dependency and cost nothing. An API change that needs a
