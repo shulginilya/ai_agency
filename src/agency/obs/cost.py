@@ -17,6 +17,25 @@ from agency.obs.logging import get_logger
 
 log = get_logger(__name__)
 
+AUTH_FAILURE_MARKERS = (
+    "failed to authenticate",
+    "oauth session expired",
+    "oauth token has expired",
+    "invalid api key",
+    "invalid bearer token",
+    "authentication_error",
+    "please run /login",
+)
+"""Substrings that mark a *credential* failure rather than a model failure.
+
+Matched against the result text because that is the only signal there is: the SDK
+reports an expired login exactly the way it reports "I could not do that" -- a
+ResultMessage with `is_error` set and prose in `result`. Keeping the two apart matters
+because they have different owners. One is a prompt to rewrite; the other is a server
+that cannot run anything at all until an operator changes its configuration, and no
+amount of retrying by the caller will move it.
+"""
+
 
 @dataclass
 class ToolCall:
@@ -63,6 +82,19 @@ class RunRecord:
         self.total_cost_usd = getattr(result, "total_cost_usd", 0.0) or 0.0
         self.usage = getattr(result, "usage", None) or {}
         self.errors = list(getattr(result, "errors", None) or [])
+
+    def auth_failure(self) -> str | None:
+        """The message when this run could not authenticate at all, else None.
+
+        Gated on `is_error` so an agent that merely *writes about* an invalid API key --
+        reviewing auth code, say -- is never mistaken for one that hit it.
+        """
+        if not self.is_error:
+            return None
+        text = " ".join(part for part in [self.output or "", *self.errors] if part).strip()
+        if any(marker in text.lower() for marker in AUTH_FAILURE_MARKERS):
+            return text or "The agent could not authenticate."
+        return None
 
     def summary(self) -> str:
         return (

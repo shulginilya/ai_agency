@@ -28,7 +28,13 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Path, Response, status
 
 from agency.api.deps import SessionsDep, SettingsDep, SlotsDep, require_api_key
-from agency.api.errors import APIError, RunTimeout, SessionBusy, UpstreamError
+from agency.api.errors import (
+    APIError,
+    RunTimeout,
+    SessionBusy,
+    UpstreamError,
+    raise_for_auth_failure,
+)
 from agency.api.schemas import (
     MessageRequest,
     MessageResponse,
@@ -159,10 +165,17 @@ async def send_message(
                 session.conversation.send(body.prompt),
                 timeout=settings.api_run_timeout_s,
             )
+            # Before the counter: a turn that could not authenticate never reached the
+            # model, so counting it would overstate the conversation. Raised *inside*
+            # the turn block on purpose -- `SessionStore.turn` lets an `APIError` through
+            # without closing the session, which is what we want here: the context is
+            # intact and the session works again the moment the server has credentials.
+            raise_for_auth_failure(record)
             session.turns += 1
     except APIError:
-        # Refused before the turn ran (busy session, saturated run pool). The session is
-        # untouched and still usable -- do not let it fall into the handlers below.
+        # Either refused before the turn ran (busy session, saturated run pool) or
+        # refused after it on credentials. Neither touched the conversation, so the
+        # session stays open -- do not let these fall into the handlers below.
         raise
     except asyncio.TimeoutError:
         log.warning(

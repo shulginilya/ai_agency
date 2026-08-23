@@ -26,6 +26,31 @@ python3 tasks.py run "What files are in the workspace? Summarise them."
 python3 tasks.py repl
 ```
 
+### Credentials
+
+The SDK spawns the Claude Code CLI, and that process authenticates from **its own
+environment** — not from this app's settings object. Set one of these in `.env`:
+
+| Variable | What it bills | Get it from |
+|---|---|---|
+| `ANTHROPIC_AUTH_TOKEN` | Whatever your gateway bills | Your LLM gateway; pair with `ANTHROPIC_BASE_URL` |
+| `ANTHROPIC_API_KEY` | Prepaid Console credits | [platform.claude.com](https://platform.claude.com) → Billing |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Your Claude subscription | `claude setup-token` (one-year token) |
+| *(all blank)* | Your subscription | The `claude login` session in `~/.claude` |
+
+**Precedence is fixed and top-down** — `config.AUTH_PRECEDENCE` mirrors the CLI's own
+order rather than inventing one, so `agency` and a bare `claude` always pick the same
+credential. Setting two is legal and silent: the loser is ignored. That is the trap
+worth knowing — a stale `ANTHROPIC_API_KEY` sitting next to a fresh
+`CLAUDE_CODE_OAUTH_TOKEN` keeps billing the account you were trying to leave, and
+surfaces as a credit error naming it. `build_options` logs `options.auth_shadowed` and
+`doctor` prints a warning when it happens.
+
+The all-blank row is the other trap: it is silent, per-machine, and it expires. When it
+does, every run returns `Failed to authenticate: OAuth session expired and could not be
+refreshed` — naming a credential you never chose. `python tasks.py doctor` and the
+`api.startup` log line both print which mode is active, so check there first.
+
 ## Commands
 
 `tasks.py` is a stdlib-only task runner, so it works everywhere without GNU Make. It
@@ -97,6 +122,11 @@ a thin adapter over the same path the CLI exercises.
 
 - **`is_error=True` is a 200.** The request succeeded; the agent failed. 5xx is reserved
   for "we could not run it", so a client can tell the two apart.
+- **...except a credential failure, which is a 502.** The SDK reports "no usable
+  credentials" in exactly the same shape as "I could not do that" — `is_error` plus
+  prose. It is not the same thing: nothing the caller sent was wrong and no retry will
+  help, so it is mapped to `502` with `type: .../agent-auth-failed` instead of arriving
+  in the UI as a chat bubble reading "OAuth session expired and could not be refreshed".
 - **Errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) problem documents** —
   including 404s from unknown routes and 422s from FastAPI's own validation. One shape,
   always, with the `request_id` in the body and the header.

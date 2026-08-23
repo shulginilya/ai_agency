@@ -73,6 +73,42 @@ SUBAGENT_LIMITS = {
 }
 
 
+def _subprocess_env(settings: Settings) -> dict[str, str]:
+    """Environment for the CLI subprocess: agent-tree caps plus credentials.
+
+    The credentials half is not incidental plumbing. The SDK spawns the Claude Code CLI,
+    and that process authenticates from *its own* environment -- if it finds no
+    ANTHROPIC_API_KEY there it does not fail, it falls back to the OAuth login cached in
+    ~/.claude. So a key that lives only in `.env` does nothing (see the note on
+    `Settings.anthropic_api_key`), and the run dies with "Failed to authenticate: OAuth
+    session expired and could not be refreshed" the moment that cached login goes stale
+    -- naming a credential the operator never chose. Docker hid this: compose.yaml
+    injects ANTHROPIC_API_KEY explicitly, so only native runs were ever affected.
+
+    Merge, not replacement, and the asymmetry matters: the Python SDK merges `env` into
+    the inherited environment (the TS SDK replaces it -- do not copy this line across).
+    A key already exported in the shell keeps working; this only adds what `.env` would
+    otherwise have swallowed.
+
+    All configured credentials are forwarded, not just the winning one, because the CLI
+    owns the precedence (`config.AUTH_PRECEDENCE` mirrors it) and picking a winner here
+    would make `agency` disagree with a bare `claude` on the same machine. What we do
+    instead is say so: two credentials configured at once is legal, silent, and nearly
+    always a mistake, so it is logged as a warning rather than left to surface as a
+    billing error naming an account the operator thought they had stopped using.
+    """
+    shadowed = settings.agent_auth_conflicts()
+    if shadowed:
+        log.warning(
+            "options.auth_shadowed",
+            using=settings.agent_auth_var(),
+            ignored=shadowed,
+            hint="The CLI authenticates with the highest-precedence credential set. "
+            "Unset the others if that is not what you meant.",
+        )
+    return {**SUBAGENT_LIMITS, **settings.agent_auth_env()}
+
+
 def _load_mcp_servers(root: Path) -> dict[str, Any]:
     """Merge external MCP servers from .mcp.json with the in-process tool server."""
     servers: dict[str, Any] = {"agency": build_tool_server()}
@@ -163,15 +199,18 @@ def build_options(
         # Deliberate: do not inherit ambient user/project/local settings. The harness
         # should behave identically on every machine and in CI.
         setting_sources=[],
-        # env is *merged* into the inherited environment by the Python SDK (the TS SDK
-        # replaces it -- do not copy this line across).
-        env=dict(SUBAGENT_LIMITS),
+        # Subagent caps + the credentials the CLI subprocess authenticates with. See
+        # `_subprocess_env`: without the second half the CLI silently falls back to a
+        # cached OAuth login, and `setting_sources=[]` does not cover that -- it governs
+        # settings files, not credentials.
+        env=_subprocess_env(settings),
     )
     log.info(
         "options.built",
         profile=profile,
         team=team,
         model=settings.model,
+        auth=settings.agent_auth_source(),
         permission_mode=permission_mode,
         allowed_tools=len(allowed),
         agents=sorted(options.agents or {}),

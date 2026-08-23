@@ -5,10 +5,29 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Profile = Literal["dev", "sandboxed", "eval"]
+
+AuthSource = Literal["auth-token", "api-key", "oauth-token", "cli-login"]
+"""Which credential the CLI subprocess will authenticate with. Not the credential."""
+
+AUTH_PRECEDENCE = ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+"""Mirrors the Claude Code CLI's own credential order, highest first.
+
+Deliberately a copy of *its* rule rather than a policy of ours: if `agency` picked a
+different winner than a bare `claude` invocation on the same machine, the harness would
+stop being a faithful way to reproduce what the CLI does -- which is the entire premise
+of the options chokepoint. Anything not listed here (an `apiKeyHelper` script, the
+`claude login` session in ~/.claude) ranks below all three and is the fallback.
+"""
+
+_AUTH_SOURCE_BY_VAR: dict[str, AuthSource] = {
+    "ANTHROPIC_AUTH_TOKEN": "auth-token",
+    "ANTHROPIC_API_KEY": "api-key",
+    "CLAUDE_CODE_OAUTH_TOKEN": "oauth-token",
+}
 
 
 class Settings(BaseSettings):
@@ -17,11 +36,58 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # The credential fields below carry a `validation_alias` (they are read from the
+        # unprefixed ANTHROPIC_* names). Without this, constructing Settings by field
+        # name in a test would hit `extra="ignore"` and be dropped in silence -- the
+        # exact failure mode this class exists to prevent.
+        populate_by_name=True,
     )
 
     profile: Profile = "dev"
     model: str = "claude-sonnet-5"
     eval_model: str = "claude-haiku-4-5-20251001"
+
+    # --- Agent credentials ----------------------------------------------------------
+    # The only settings here that are NOT AGENCY_-prefixed, because they are not ours:
+    # they are the variable names the Claude Code CLI subprocess reads. Declaring
+    # them is what makes `.env` reach it at all. Without them a key written to `.env` is
+    # dropped by this class (wrong prefix, extra="ignore"), never exported to os.environ
+    # by anything else, and the CLI quietly falls back to the OAuth login cached in
+    # ~/.claude -- so a perfectly good key produces "Failed to authenticate: OAuth
+    # session expired and could not be refreshed", an error about a credential nobody
+    # meant to use. `options.build_options` puts these in the subprocess environment.
+    #
+    # SecretStr so `agency doctor`, and any log line that repr()s Settings, prints
+    # `**********` rather than the key.
+    anthropic_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ANTHROPIC_API_KEY", "AGENCY_ANTHROPIC_API_KEY"),
+        description="Blank => fall back to an existing `claude login` session on the host.",
+    )
+    # A one-year token from `claude setup-token`. Authenticates against a Claude
+    # subscription (Pro/Max/Team/Enterprise) rather than prepaid API credits, so it is
+    # the answer to "Credit balance is too low" for someone who pays for a plan instead.
+    # Outranked by both variables above -- see AUTH_PRECEDENCE and `agent_auth_conflicts`.
+    claude_code_oauth_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "CLAUDE_CODE_OAUTH_TOKEN", "AGENCY_CLAUDE_CODE_OAUTH_TOKEN"
+        ),
+        description="Subscription OAuth token from `claude setup-token`. Blank => unused.",
+    )
+    # Sent as `Authorization: Bearer`, and it outranks the API key. This is for an LLM
+    # gateway or proxy that authenticates with bearer tokens; pair it with
+    # `anthropic_base_url`, which is otherwise only half a gateway configuration.
+    anthropic_auth_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ANTHROPIC_AUTH_TOKEN", "AGENCY_ANTHROPIC_AUTH_TOKEN"),
+        description="Bearer token for a gateway that fronts the API. Blank => unused.",
+    )
+    anthropic_base_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ANTHROPIC_BASE_URL", "AGENCY_ANTHROPIC_BASE_URL"),
+        description="Point the CLI at a gateway or proxy. Blank => the public API.",
+    )
 
     # Safety rails. max_budget_usd is enforced by the SDK itself, not by us.
     max_turns: int = 40
@@ -92,6 +158,56 @@ class Settings(BaseSettings):
 
     # Swagger/ReDoc/openapi.json. Turn off in production.
     api_docs_enabled: bool = True
+
+    def agent_auth_env(self) -> dict[str, str]:
+        """Credentials for the SDK subprocess, as environment variables.
+
+        Empty is a supported outcome, not a failure: the CLI then uses the `claude
+        login` session on this machine, which is the right mode for local development.
+        What is not acceptable is that mode being *silent*, which is why
+        `agent_auth_source()` exists and is logged at startup.
+
+        Blank and whitespace-only values are omitted rather than exported empty. The
+        difference is not cosmetic: an empty `ANTHROPIC_API_KEY` is a credential the CLI
+        tries and fails with, while an absent one is a credential it falls past.
+        """
+        env: dict[str, str] = {}
+        secrets: list[tuple[str, SecretStr | None]] = [
+            ("ANTHROPIC_AUTH_TOKEN", self.anthropic_auth_token),
+            ("ANTHROPIC_API_KEY", self.anthropic_api_key),
+            ("CLAUDE_CODE_OAUTH_TOKEN", self.claude_code_oauth_token),
+        ]
+        for var, secret in secrets:
+            value = secret.get_secret_value().strip() if secret else ""
+            if value:
+                env[var] = value
+        base_url = (self.anthropic_base_url or "").strip()
+        if base_url:
+            env["ANTHROPIC_BASE_URL"] = base_url
+        return env
+
+    def agent_auth_var(self) -> str | None:
+        """The variable the CLI will actually authenticate with, or None for cli-login."""
+        env = self.agent_auth_env()
+        return next((var for var in AUTH_PRECEDENCE if var in env), None)
+
+    def agent_auth_source(self) -> AuthSource:
+        """Where the agent's credentials come from. Never the credentials themselves."""
+        var = self.agent_auth_var()
+        return _AUTH_SOURCE_BY_VAR[var] if var else "cli-login"
+
+    def agent_auth_conflicts(self) -> list[str]:
+        """Credential variables that are set but outranked, highest first.
+
+        Configuring two is not an error -- the CLI has a defined precedence and we honour
+        it -- but it is almost always a mistake, and a silent one. The live case: someone
+        on a Claude subscription sets CLAUDE_CODE_OAUTH_TOKEN, leaves a stale
+        ANTHROPIC_API_KEY in `.env`, and every run bills the API account they were trying
+        to stop using. The symptom is a billing or credit error naming a credential they
+        thought they had switched away from, which reads as the fix not having worked.
+        """
+        env = self.agent_auth_env()
+        return [var for var in AUTH_PRECEDENCE if var in env][1:]
 
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.api_cors_origins.split(",") if origin.strip()]
