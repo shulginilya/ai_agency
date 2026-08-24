@@ -41,6 +41,21 @@ def test_test_writer_can_write_and_execute() -> None:
     assert {"Write", "Bash"}.issubset(tools)
 
 
+def test_developer_can_read_diagnose_and_edit() -> None:
+    # The three capabilities the role is defined by. Drop Edit and it becomes a second
+    # reviewer; drop Bash and it cannot verify its own fix before reporting it done.
+    tools = set(TEAM["developer"].tools or [])
+    assert {"Read", "Grep", "Glob"}.issubset(tools), "developer cannot read the code"
+    assert "Edit" in tools, "developer cannot fix what it finds"
+    assert "Bash" in tools, "developer cannot verify its own change"
+
+
+def test_developer_runs_on_opus() -> None:
+    # An explicit ID, not the `opus` alias: the alias silently follows whatever the CLI
+    # maps it to, and being the strongest model on the team is this worker's whole point.
+    assert TEAM["developer"].model == "claude-opus-5"
+
+
 def test_worker_descriptions_are_specific_enough_to_route_on() -> None:
     # `description` is what the manager matches a task against. One-liners like
     # "reviews code" make delegation a coin flip.
@@ -71,6 +86,20 @@ def test_solo_mode_is_unchanged(settings: Settings, tmp_path: Path) -> None:
     opts = build_options("dev", settings=settings, project_root=tmp_path)
     assert opts.system_prompt == SYSTEM_PROMPT
     assert set(opts.agents or {}) == {"researcher", "critic"}
+
+
+def test_team_mode_exposes_every_worker(settings: Settings, tmp_path: Path) -> None:
+    # A worker defined in TEAM but never reachable from a run is the failure this
+    # catches: the manager prompt advertises it and delegation then 404s.
+    opts = build_options("dev", settings=settings, project_root=tmp_path, team=True)
+    assert {"reviewer", "test-writer", "developer"}.issubset(set(opts.agents or {}))
+
+
+def test_manager_prompt_advertises_every_worker() -> None:
+    # The manager routes on this prompt. A worker missing from it is a worker that
+    # never gets used, with no error anywhere to say so.
+    for name in TEAM:
+        assert f"`{name}`" in MANAGER_PROMPT, f"{name} is not named in MANAGER_PROMPT"
 
 
 def test_delegation_tool_is_auto_approved_under_both_names(
