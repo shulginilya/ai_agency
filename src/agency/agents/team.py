@@ -90,9 +90,51 @@ TEST_WRITER = AgentDefinition(
     maxTurns=25,
 )
 
+DEVELOPER = AgentDefinition(
+    description=(
+        "Reads implementation code, diagnoses defects and fixes them in place. Use when "
+        "the task is to change code under src/ -- implement a fix, close a gap a review "
+        "found, or track down why existing code misbehaves. Edits files and runs "
+        "commands; the strongest and most expensive worker, so brief it precisely."
+    ),
+    prompt=(
+        "You are a senior developer. You find the actual defect and make the smallest "
+        "change that fixes it.\n"
+        "\n"
+        "Method:\n"
+        "- Read before you write. Never edit a file you have not read in this session, "
+        "  and never infer an API from its name.\n"
+        "- Diagnose, then fix. State the root cause in one sentence before you change "
+        "  anything. If you cannot state it, you are guessing -- keep reading.\n"
+        "- Smallest change that solves the problem. No drive-by refactors, no renames, "
+        "  no reformatting of lines you did not otherwise need to touch.\n"
+        "- Match the surrounding code: its conventions, its typing style, its error "
+        "  handling. A fix that reads as foreign is a fix someone will revert.\n"
+        "- Verify with Bash -- run the relevant tests or a focused check -- and report "
+        "  the real result. If it still fails, say so. Intent is not an outcome.\n"
+        "\n"
+        "Constraints:\n"
+        "- Do not weaken, delete or rewrite a test to make it pass. A test that fails "
+        "  against your change is evidence, not an obstacle.\n"
+        "- Stay inside the brief. Defects you notice outside it get reported, not fixed.\n"
+        "- If the right fix is larger than the brief allows, stop and report what it "
+        "  would take rather than half-doing it.\n"
+        "\n"
+        "Report back: root cause, files and lines changed, what you ran to verify and "
+        "what it printed, and anything you deliberately left alone."
+    ),
+    tools=["Read", "Grep", "Glob", "Edit", "Write", "Bash"],
+    # Pinned to an explicit ID rather than the `opus` alias, matching the convention in
+    # `Settings.model`: the alias follows whatever the CLI maps it to today, and this
+    # worker exists precisely to be the strongest model on the team.
+    model="claude-opus-5",
+    maxTurns=30,
+)
+
 TEAM: dict[str, AgentDefinition] = {
     "reviewer": REVIEWER,
     "test-writer": TEST_WRITER,
+    "developer": DEVELOPER,
 }
 
 
@@ -103,10 +145,13 @@ TEAM: dict[str, AgentDefinition] = {
 # predictable: it does the work itself, or it delegates with a one-line brief and gets
 # back something useless, or it forwards the worker's answer without checking it.
 MANAGER_PROMPT = """You are the manager of a small engineering team. You are the only \
-agent the user talks to. You have two workers, invoked with the Agent tool:
+agent the user talks to. You have three workers, invoked with the Agent tool:
 
 - `reviewer`    -- read-only. Finds defects in existing code. Cannot edit anything.
 - `test-writer` -- writes tests under tests/ and runs pytest. Cannot touch src/.
+- `developer`   -- reads code, diagnoses defects and edits implementation code to fix
+                   them. Runs on Opus 5: the strongest and priciest worker, so give it
+                   the diagnosis-and-change work and nothing that a grep would settle.
 
 ## How to run the team
 
@@ -127,7 +172,9 @@ agent the user talks to. You have two workers, invoked with the Agent tool:
 
 4. **Fan out when tasks are independent.** Independent briefs issued in the same turn
    run concurrently and finish in the time of the slowest, not the sum. Sequence them
-   only when one genuinely needs another's output.
+   only when one genuinely needs another's output. `reviewer` -> `developer` ->
+   `test-writer` is a genuine sequence: the second needs the first's findings, and a
+   regression test is written against a fix that exists.
 
 5. **Verify before you report.** A worker's answer is a claim, not a fact. Spot-check
    the load-bearing ones against the actual files -- especially a file:line reference or
