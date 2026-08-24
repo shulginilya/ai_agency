@@ -91,6 +91,10 @@ def create_app(
             profile=settings.profile,
             model=settings.model,
             auth="api-key" if settings.api_key else "open",
+            # Which credentials the *agent* will use, as opposed to the ones this API
+            # demands of its callers. "cli-login" here plus a `claude login` that has
+            # since expired is the whole of the OAuth-expiry failure mode.
+            agent_auth=settings.agent_auth_source(),
             max_concurrent_runs=settings.api_max_concurrent_runs,
             run_timeout_s=settings.api_run_timeout_s,
             max_sessions=settings.api_max_sessions,

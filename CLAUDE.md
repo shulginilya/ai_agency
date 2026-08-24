@@ -70,6 +70,16 @@ Conventions:
 ## Conventions
 
 - All settings come from env via `Settings`; never read `os.environ` directly.
+- `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN` and
+  `ANTHROPIC_BASE_URL` are the settings with no `AGENCY_` prefix — read via an explicit
+  `validation_alias` because they belong to the CLI subprocess, and
+  `options._subprocess_env` is what gets them there. Anything that bypasses that path
+  leaves the CLI authenticating from a cached `claude login` instead, which fails as
+  "OAuth session expired and could not be refreshed" long after the fact.
+- Credentials are all forwarded; `config.AUTH_PRECEDENCE` mirrors the CLI's order rather
+  than picking a winner here, so the harness cannot disagree with a bare `claude` run.
+  Two set at once is legal and silent, so it is logged (`options.auth_shadowed`) — never
+  resolved quietly.
 - New tools go in `tools/`, get registered in `tools/registry.py`, and get a unit test
   that calls the underlying function directly (no SDK loop).
 - Any behaviour change should come with an eval case in `evals/cases/`. Eyeballing

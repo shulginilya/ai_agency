@@ -19,6 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from agency.api.middleware import REQUEST_ID_HEADER
+from agency.obs.cost import RunRecord
 from agency.obs.logging import get_logger
 
 log = get_logger(__name__)
@@ -103,6 +104,45 @@ class UpstreamError(APIError):
     status_code = 502
     title = "Upstream Failure"
     slug = "upstream-error"
+
+
+class AgentAuthError(UpstreamError):
+    """The agent could not authenticate: the server has no usable model credentials.
+
+    A subclass of `UpstreamError`, so a client already branching on 502 keeps working,
+    with its own `type` URI so that client -- or the human being paged -- can tell "our
+    credentials were rejected" from "the SDK fell over". Not a 4xx: nothing the caller
+    sends can fix it, and retrying is guaranteed to fail the same way.
+    """
+
+    status_code = 502
+    title = "Agent Authentication Failed"
+    slug = "agent-auth-failed"
+
+
+def raise_for_auth_failure(record: RunRecord) -> None:
+    """Map a credential failure to 502 instead of letting it through as a 200.
+
+    `is_error=True` is a 200 everywhere else in this API, deliberately: the request
+    worked, the agent did not. A failed *login* is the other thing entirely -- the
+    harness never reached the model -- so it belongs with the 5xx family. Left as a 200
+    it reaches a frontend as a chat bubble reading "OAuth session expired and could not
+    be refreshed", with no status code to branch on and nothing the user can do about it.
+
+    Lives here rather than in each router so both entrypoints map it identically. The
+    import is safe in both directions: `obs.cost` is SDK-free and knows nothing of HTTP.
+    """
+    detail = record.auth_failure()
+    if detail is None:
+        return
+    log.error("api.agent_auth_failed", run_id=record.run_id, detail=detail)
+    raise AgentAuthError(
+        f"The agent could not authenticate with the model provider: {detail}. "
+        "This is a server configuration problem -- set one of ANTHROPIC_API_KEY, "
+        "CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_AUTH_TOKEN in the server's environment "
+        "(or re-run `claude login` on its host) and restart it. "
+        "Re-sending this request will not help."
+    )
 
 
 def problem(

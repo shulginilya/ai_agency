@@ -24,7 +24,7 @@ import asyncio
 from fastapi import APIRouter, Depends, status
 
 from agency.api.deps import RunnerDep, SettingsDep, SlotsDep, require_api_key
-from agency.api.errors import RunTimeout, UpstreamError
+from agency.api.errors import RunTimeout, UpstreamError, raise_for_auth_failure
 from agency.api.schemas import Problem, RunRequest, RunResponse
 from agency.obs.logging import get_logger
 
@@ -76,6 +76,12 @@ async def create_run(
         except Exception as exc:  # noqa: BLE001 - mapped to 502, re-logged with traceback
             log.exception("api.run.failed", error=str(exc))
             raise UpstreamError(f"The agent loop failed: {type(exc).__name__}") from exc
+
+    # ...with one exception, checked first: a run that could not authenticate never
+    # reached the model, so it is "we could not run it" wearing a model failure's
+    # clothes. 502 with its own type URI, not a 200 whose body happens to say
+    # "OAuth session expired".
+    raise_for_auth_failure(record)
 
     # An agent that errored is a successful request with is_error=True. Reserve 5xx for
     # "we could not run it", so a client can tell "the model failed" from "we failed".

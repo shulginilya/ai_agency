@@ -43,6 +43,21 @@ def _finished_record(**overrides: Any) -> RunRecord:
     return record
 
 
+OAUTH_EXPIRED = "Failed to authenticate: OAuth session expired and could not be refreshed"
+"""Verbatim what the SDK returns when the CLI subprocess has no usable credentials.
+
+Kept as the literal string rather than something shorter: this is matched by substring
+in `RunRecord.auth_failure`, so a test that invented its own wording would assert the
+mapping without ever exercising the marker list that has to recognise the real one.
+"""
+
+
+def _auth_failed_record() -> RunRecord:
+    """A run that never reached the model. `is_error` and prose -- the SDK gives the
+    same shape for this as for "I could not do that", which is the whole difficulty."""
+    return _finished_record(is_error=True, output=OAUTH_EXPIRED, num_turns=1, total_cost_usd=0.0)
+
+
 class FakeRunner:
     """Stands in for `runner.run_once`. Records what the route asked for."""
 
@@ -68,11 +83,22 @@ class FakeConversation:
     session held its conversation open, and if they do not, it did not.
     """
 
-    def __init__(self, profile: Profile, team: bool, delay: float = 0.0, boom: str = "") -> None:
+    def __init__(
+        self,
+        profile: Profile,
+        team: bool,
+        delay: float = 0.0,
+        boom: str = "",
+        auth_fail: bool = False,
+    ) -> None:
         self.profile = profile
         self.team = team
         self.delay = delay
         self.boom = boom
+        # Distinct from `boom`: a credential failure is a turn that *completed* and
+        # returned an errored record, not a transport exception. The two take different
+        # paths through the route and only one of them may close the session.
+        self.auth_fail = auth_fail
         self.prompts: list[str] = []
         self.closed = 0
 
@@ -82,6 +108,8 @@ class FakeConversation:
             await asyncio.sleep(self.delay)
         if self.boom:
             raise RuntimeError(self.boom)
+        if self.auth_fail:
+            return _auth_failed_record()
         return _finished_record(run_id=f"turn{len(self.prompts)}", prompt=prompt)
 
     async def aclose(self) -> None:
@@ -93,13 +121,16 @@ class FakeConversation:
 class FakeConversations:
     """Stands in for `deps.make_conversation_factory`. Records what was opened."""
 
-    def __init__(self, delay: float = 0.0, boom: str = "") -> None:
+    def __init__(self, delay: float = 0.0, boom: str = "", auth_fail: bool = False) -> None:
         self.delay = delay
         self.boom = boom
+        self.auth_fail = auth_fail
         self.opened: list[FakeConversation] = []
 
     async def __call__(self, *, profile: Profile, team: bool = False) -> Conversation:
-        conversation = FakeConversation(profile, team, delay=self.delay, boom=self.boom)
+        conversation = FakeConversation(
+            profile, team, delay=self.delay, boom=self.boom, auth_fail=self.auth_fail
+        )
         self.opened.append(conversation)
         return conversation
 
@@ -184,6 +215,36 @@ async def test_an_errored_agent_is_still_a_200(api_settings: Settings) -> None:
         response = await c.post("/v1/runs", json={"prompt": "x"})
     assert response.status_code == 200
     assert response.json()["is_error"] is True
+
+
+async def test_a_credential_failure_is_a_502_not_a_200(api_settings: Settings) -> None:
+    # The exception to the rule above, and the reason the rule needs one. An expired or
+    # missing credential arrives wearing a model failure's clothes -- is_error plus
+    # prose -- but nothing about the request was wrong and no retry will help. Left as a
+    # 200 it reaches the browser as a chat bubble reading "OAuth session expired", which
+    # is the agent apparently talking about the server's own configuration.
+    runner = FakeRunner(_auth_failed_record())
+    async with make_client(api_settings, runner) as c:
+        response = await c.post("/v1/runs", json={"prompt": "x"})
+    assert response.status_code == 502
+    body = response.json()
+    assert body["type"].endswith("/agent-auth-failed")
+    # Actionable and machine-readable: the type URI is what a client switches on, the
+    # detail is what the operator reads.
+    assert "ANTHROPIC_API_KEY" in body["detail"]
+    assert response.headers["content-type"].startswith(CONTENT_TYPE)
+
+
+async def test_an_agent_talking_about_api_keys_is_not_an_auth_failure(
+    api_settings: Settings,
+) -> None:
+    # The marker match is on the result text, so the guard that keeps it honest is
+    # `is_error`. An agent that succeeds while *writing* about an invalid API key --
+    # reviewing auth code, say -- is a 200 like any other.
+    runner = FakeRunner(_finished_record(output="Your code passes an invalid API key here."))
+    async with make_client(api_settings, runner) as c:
+        response = await c.post("/v1/runs", json={"prompt": "review this"})
+    assert response.status_code == 200
 
 
 async def test_every_response_carries_a_request_id(client: httpx.AsyncClient) -> None:
@@ -567,6 +628,27 @@ async def test_a_failed_turn_closes_the_session_without_leaking_internals(
         assert "RuntimeError" in response.json()["detail"]
         assert conversations.opened[0].closed == 1
         assert (await c.get(f"/v1/sessions/{session['id']}")).status_code == 404
+
+
+async def test_a_credential_failure_does_not_close_the_session(api_settings: Settings) -> None:
+    # The counterpart to the timeout and transport cases above: those leave the SDK
+    # client in an unknown state, so the session dies with them. This one does not --
+    # the turn completed and simply never reached the model, so the conversation is
+    # intact and will work again the moment the server has credentials. Killing it would
+    # cost the user their context over a problem that is entirely ours.
+    conversations = FakeConversations(auth_fail=True)
+    async with make_client(api_settings, FakeRunner(), conversations) as c:
+        session = await _open(c)
+        response = await c.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "x"})
+        assert response.status_code == 502
+        assert response.json()["type"].endswith("/agent-auth-failed")
+        assert conversations.opened[0].closed == 0
+
+        alive = await c.get(f"/v1/sessions/{session['id']}")
+        assert alive.status_code == 200
+        # And the turn is not counted: it never reached the model, so counting it would
+        # overstate the conversation to anyone reading `turns`.
+        assert alive.json()["turns"] == 0
 
 
 async def test_a_turn_takes_a_run_slot(api_settings: Settings) -> None:

@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from agency.agents.team import TEAM
-from agency.config import Profile, get_settings
+from agency.config import AuthSource, Profile, get_settings
 from agency.hooks.delegation import delegations
 from agency.obs.cost import RunRecord
 from agency.obs.logging import configure_logging
@@ -19,6 +19,19 @@ from agency.runner import Agent, Emit, run_once
 
 app = typer.Typer(add_completion=False, help="Agentic development harness.")
 console = Console()
+
+AGENT_AUTH_HELP: dict[AuthSource, str] = {
+    "auth-token": "ANTHROPIC_AUTH_TOKEN (bearer token, e.g. an LLM gateway)",
+    "api-key": "ANTHROPIC_API_KEY -- billed to that key's prepaid Console credits",
+    "oauth-token": "CLAUDE_CODE_OAUTH_TOKEN -- billed to your Claude subscription",
+    "cli-login": (
+        "no credential configured -- falling back to the `claude login` session "
+        "cached on this host, which expires"
+    ),
+}
+"""What `doctor` prints for each credential source. Says where the *billing* lands as
+well as which variable won, because "which account is this spending" is the question
+someone actually has when they run `doctor`."""
 
 
 def _make_emit(show_thinking: bool) -> Emit:
@@ -130,6 +143,7 @@ def serve(
             f"http://{settings.api_host}:{settings.api_port}\n"
             f"profile: [bold]{settings.profile}[/bold]  |  "
             f"auth: [bold]{'api-key' if settings.api_key else 'open'}[/bold]  |  "
+            f"agent: [bold]{settings.agent_auth_source()}[/bold]  |  "
             f"docs: {'/docs' if settings.api_docs_enabled else 'disabled'}",
             title="agency serve",
             expand=False,
@@ -165,6 +179,18 @@ def doctor() -> None:
     console.print(f".mcp.json: {'found' if Path('.mcp.json').exists() else 'absent'}")
     auth = "api-key" if settings.api_key else "open"
     console.print(f"api:       http://{settings.api_host}:{settings.api_port} ({auth})")
+    # The agent's own credentials, which are not the API's. "cli-login" is legitimate
+    # locally and a landmine on a server: it means every run depends on a `claude login`
+    # cached in ~/.claude, and the day it expires every run returns "OAuth session
+    # expired and could not be refreshed".
+    console.print(f"agent:     {AGENT_AUTH_HELP[settings.agent_auth_source()]}")
+    shadowed = settings.agent_auth_conflicts()
+    if shadowed:
+        # Legal, silent, and nearly always a mistake -- see Settings.agent_auth_conflicts.
+        console.print(
+            f"[yellow]           warning:[/yellow] {', '.join(shadowed)} also set but "
+            f"outranked by {settings.agent_auth_var()}. Unset it if you meant to switch."
+        )
 
 
 
