@@ -17,7 +17,10 @@ below follows from that:
   the same reason `RunSlots` bounds runs.
 - **Reaped.** An idle session expires after `api_session_idle_ttl_s`, because a client
   that crashes mid-conversation cannot send the `DELETE`, and the alternative is a
-  subprocess that lives until the container restarts.
+  subprocess that lives until the container restarts. Two paths run the same `reap()`:
+  lazily from the store's entry points, and on a timer from `reap_forever`, which the
+  lifespan owns. The timer is the one that matters, because the client this protects
+  against is by definition not sending requests any more.
 - **Serialised.** One turn at a time per session. Two overlapping `query()` calls on one
   `ClaudeSDKClient` interleave into a single conversation, and the second caller drains
   a response stream that belongs to the first. A concurrent turn is refused with 409,
@@ -270,13 +273,15 @@ class SessionStore:
     async def reap(self) -> None:
         """Close sessions idle past the TTL.
 
-        Called from the store's own entry points rather than from a background task, and
-        that is deliberate: a task started in the lifespan never runs under
-        `httpx.ASGITransport`, so the reaping path would be invisible to the entire test
-        suite -- exactly the trap that assembling app state in the lifespan already was.
-        Lazy reaping also cannot outlive the app or leak a task on shutdown. The cost is
-        that a fully idle server holds its sessions until someone asks; the TTL is a
-        floor on their lifetime, not a ceiling.
+        Called two ways: lazily from this store's own entry points, and on a timer by
+        `reap_forever`. It was lazy-only at first, on the reasoning that a task started
+        in the lifespan never runs under `httpx.ASGITransport` and so would be invisible
+        to the test suite. That is still true of the *task*, and it is why this method
+        stayed independently callable -- but it was the wrong trade, because the lazy
+        path only fires while someone is still talking to the server, and the session
+        that needs collecting is the one whose client has stopped. A frontend that
+        closed without sending its `DELETE` left a subprocess alive indefinitely with
+        the TTL never once evaluated. Both paths now exist; see `reap_forever`.
         """
         if self.idle_ttl_s <= 0:
             return
@@ -286,11 +291,67 @@ class SessionStore:
             log.info("api.session.expired", session_id=session_id, idle_ttl_s=self.idle_ttl_s)
             await self.close(session_id, reason="expired")
 
+    @property
+    def reap_interval_s(self) -> float:
+        """How often `reap_forever` should wake, derived rather than configured.
+
+        A quarter of the TTL, clamped at both ends: often enough that "expired" and
+        "collected" are close together, rare enough that an idle server is not spinning,
+        and floored so that a deliberately tiny TTL cannot turn this into a busy loop.
+        Zero when the TTL is disabled, which is what stops the loop starting at all.
+        """
+        if self.idle_ttl_s <= 0:
+            return 0.0
+        return max(1.0, min(60.0, self.idle_ttl_s / 4))
+
+    async def reap_forever(self, interval_s: float | None = None) -> None:
+        """Reap on a timer until cancelled. Owned by the app's lifespan.
+
+        Takes its interval as an argument so a test can drive it in milliseconds rather
+        than waiting out `reap_interval_s`; production passes nothing.
+
+        The loop swallows exceptions from `reap` on purpose. This is the only thing that
+        collects a session whose client is gone, so a single bad teardown must not be
+        able to end it -- a reaper that dies is indistinguishable from no reaper at all,
+        and the symptom arrives hours later as a machine full of CLI subprocesses.
+        `close` already logs its own failures; this catches whatever gets past it.
+        """
+        interval = self.reap_interval_s if interval_s is None else interval_s
+        if self.idle_ttl_s <= 0 or interval <= 0:
+            log.info("api.session.reaper_disabled", idle_ttl_s=self.idle_ttl_s)
+            return
+        log.info("api.session.reaper_started", interval_s=interval, idle_ttl_s=self.idle_ttl_s)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.reap()
+            except Exception as exc:  # noqa: BLE001 - a reaper that dies stops reaping
+                log.warning("api.session.reaper_error", error=str(exc))
+
     async def aclose_all(self) -> None:
-        """Close everything. Called on shutdown so a stopping container does not orphan
-        one subprocess per open session."""
-        for session_id in list(self._sessions):
-            await self.close(session_id, reason="shutdown")
+        """Close everything, concurrently. Called on shutdown so a stopping server does
+        not orphan one subprocess per open session.
+
+        `gather`, not a loop over `close`. `SubprocessCLITransport.close()` bounds itself
+        at roughly twenty seconds -- five for the stdin lock, then wait -> terminate ->
+        kill at five each -- and the SDK runs that teardown inside a shielded cancel
+        scope. Sequentially that is `api_max_sessions` times twenty seconds of a terminal
+        that looks hung after Ctrl-C, with the second Ctrl-C unable to get through the
+        shield. Concurrently the whole shutdown costs one such bound rather than N.
+
+        `return_exceptions=True` because `close` already logs and swallows a failed
+        teardown, so anything reaching here is a bug in the bookkeeping -- and letting it
+        abort the gather would leave the *remaining* sessions unclosed, which is the
+        exact leak this method exists to prevent.
+        """
+        session_ids = list(self._sessions)
+        if not session_ids:
+            return
+        log.info("api.sessions.closing", count=len(session_ids))
+        await asyncio.gather(
+            *(self.close(session_id, reason="shutdown") for session_id in session_ids),
+            return_exceptions=True,
+        )
 
 
 __all__ = [

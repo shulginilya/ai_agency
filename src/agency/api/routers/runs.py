@@ -19,8 +19,7 @@ rewrite.
 
 from __future__ import annotations
 
-import asyncio
-
+import anyio
 from fastapi import APIRouter, Depends, status
 
 from agency.api.deps import RunnerDep, SettingsDep, SlotsDep, require_api_key
@@ -60,14 +59,21 @@ async def create_run(
     async with slots.slot():
         log.info("api.run.start", profile=body.profile or settings.profile, team=body.team)
         try:
-            record = await asyncio.wait_for(
-                runner(body.prompt, profile=body.profile, team=body.team),
-                timeout=settings.api_run_timeout_s,
-            )
-        except asyncio.TimeoutError:
-            # wait_for cancels the coroutine, which unwinds Agent.__aexit__ and tears
-            # down the SDK subprocess. Without that the process would be orphaned and
-            # keep billing after the client has already given up.
+            with anyio.fail_after(settings.api_run_timeout_s):
+                record = await runner(body.prompt, profile=body.profile, team=body.team)
+        except TimeoutError:
+            # The timeout unwinds `Agent.__aexit__`, which tears down the SDK
+            # subprocess; without that the process is orphaned and keeps billing after
+            # the client has given up.
+            #
+            # It has to be `anyio.fail_after` for that to be true, though this file
+            # asserted it while using `asyncio.wait_for`, which does the opposite.
+            # `wait_for` cancels a wrapper task -- a raw asyncio cancellation -- and
+            # `SubprocessCLITransport.close()` documents that its shield only defers
+            # cancellation raised by an anyio cancel scope. A raw one lands at the first
+            # await of the teardown and skips the terminate -> kill escalation, leaving
+            # exactly the orphan the comment claimed to prevent. `TimeoutError` is the
+            # builtin for the same reason it is in routers/sessions.py.
             log.warning("api.run.timeout", timeout_s=settings.api_run_timeout_s)
             raise RunTimeout(
                 f"The run exceeded the {settings.api_run_timeout_s:.0f}s server timeout "

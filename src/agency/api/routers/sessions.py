@@ -22,9 +22,9 @@ queue, and of closing a session after a failed turn, are both reasoned there.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Annotated
 
+import anyio
 from fastapi import APIRouter, Depends, Path, Response, status
 
 from agency.api.deps import SessionsDep, SettingsDep, SlotsDep, require_api_key
@@ -161,10 +161,18 @@ async def send_message(
     try:
         async with sessions.turn(session), slots.slot():
             log.info("api.session.message", session_id=session.id, turn=session.turns + 1)
-            record = await asyncio.wait_for(
-                session.conversation.send(body.prompt),
-                timeout=settings.api_run_timeout_s,
-            )
+            # `anyio.fail_after`, not `asyncio.wait_for`, and the difference is a
+            # leaked subprocess. `wait_for` wraps the call in a *task* and cancels that,
+            # which is a raw asyncio cancellation, and `SubprocessCLITransport.close()`
+            # documents that its shield only defers cancellation originating from an
+            # anyio cancel scope -- a raw one is delivered at the next await inside the
+            # teardown, skipping the terminate -> kill escalation below it. The CLI child
+            # then survives the very timeout meant to reap it. An anyio scope cancels
+            # this task in place, the SDK's shield holds, and the child actually dies.
+            # (It also keeps the turn in the request's own task, which is what the SDK's
+            # own `_task_compat` notes async-generator finalisation is fussy about.)
+            with anyio.fail_after(settings.api_run_timeout_s):
+                record = await session.conversation.send(body.prompt)
             # Before the counter: a turn that could not authenticate never reached the
             # model, so counting it would overstate the conversation. Raised *inside*
             # the turn block on purpose -- `SessionStore.turn` lets an `APIError` through
@@ -177,7 +185,10 @@ async def send_message(
         # refused after it on credentials. Neither touched the conversation, so the
         # session stays open -- do not let these fall into the handlers below.
         raise
-    except asyncio.TimeoutError:
+    except TimeoutError:
+        # The builtin, not `asyncio.TimeoutError`: anyio raises the former, and on 3.10
+        # -- which this package still supports -- the two are distinct classes, so
+        # `except asyncio.TimeoutError` would silently fall through to the 502 below.
         log.warning(
             "api.session.timeout",
             session_id=session_id,

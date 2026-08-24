@@ -11,8 +11,9 @@ the dependencies in `deps.py` are thin readers of that state.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Iterable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        store: SessionStore = app.state.sessions
         configure_logging(settings.log_level, settings.log_format)
         # Fail at startup, not on the first request: a workspace that cannot be created
         # should stop the container from ever going healthy.
@@ -99,20 +101,37 @@ def create_app(
             run_timeout_s=settings.api_run_timeout_s,
             max_sessions=settings.api_max_sessions,
             session_idle_ttl_s=settings.api_session_idle_ttl_s,
+            session_reap_interval_s=store.reap_interval_s,
             docs=settings.api_docs_enabled,
         )
+        # The one background task this app runs. It has to be a task rather than the
+        # lazy reaping the store also does, because the session that needs collecting is
+        # by definition one whose client has stopped making requests -- see
+        # `SessionStore.reap_forever`. Started here and cancelled below, so it cannot
+        # outlive the app or leak on shutdown, which was the original objection to it.
+        reaper = asyncio.create_task(store.reap_forever(), name="agency.session-reaper")
         try:
             yield
         finally:
+            # Cancel the reaper first: it and `aclose_all` mutate the same map, and a
+            # reap firing mid-shutdown would race the gather for the same session ids.
+            reaper.cancel()
+            with suppress(asyncio.CancelledError):
+                await reaper
             # Sessions are the only state that outlives a request, and each one is a
-            # subprocess. Closing them here is what stops a `docker stop` from leaving
-            # orphans behind. (Not reachable under httpx.ASGITransport, which never runs
-            # lifespan events -- tests drive `SessionStore` directly instead.)
-            await app.state.sessions.aclose_all()
+            # subprocess. Closing them here is what stops a `docker stop` -- or a Ctrl-C
+            # -- from leaving orphans behind. (Not reachable under httpx.ASGITransport,
+            # which never runs lifespan events -- tests drive `SessionStore` directly.)
+            #
+            # Read the count *before* closing. It used to be read after, so the line
+            # this exists to produce reported `sessions_closed=0` on every shutdown,
+            # including the ones where it would have been the useful number.
+            open_sessions = store.count
+            await store.aclose_all()
             log.info(
                 "api.shutdown",
                 in_flight=app.state.slots.in_flight,
-                sessions_closed=app.state.sessions.count,
+                sessions_closed=open_sessions,
             )
 
     docs_on = settings.api_docs_enabled
