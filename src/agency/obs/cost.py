@@ -61,6 +61,7 @@ class RunRecord:
     num_turns: int = 0
     duration_ms: int = 0
     total_cost_usd: float = 0.0
+    turn_cost_usd: float = 0.0
     usage: dict[str, Any] = field(default_factory=dict)
     tool_calls: list[ToolCall] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -68,11 +69,49 @@ class RunRecord:
     def record_tool(self, call: ToolCall) -> None:
         self.tool_calls.append(call)
 
+    def reset_for_turn(self, run_id: str, prompt: str) -> None:
+        """Re-arm this record for the next turn of a multi-turn session.
+
+        Mutates in place rather than returning a fresh record, and that is not an
+        optimisation: `build_options` binds this object into the audit hooks when the
+        session connects, so a replacement would leave the hooks writing into the record
+        of turn one for the rest of the conversation.
+
+        Every field `absorb_result` sets is cleared here, not just the obvious two.
+        `absorb_result` only overwrites what the CLI actually sent, so a turn that ended
+        without a `ResultMessage` -- cancelled, timed out, killed -- would otherwise
+        persist the *previous* turn's output, duration and error flag under this turn's
+        run id, which is worse than reporting nothing.
+
+        `total_cost_usd` is the deliberate exception. The CLI reports it cumulatively
+        for the whole session, so resetting it would not make it per-turn, it would just
+        make it wrong on the next turn; it keeps accumulating and `turn_cost_usd` carries
+        the delta instead. `session_id` is kept for the same reason -- the CLI session
+        outlives the turn.
+        """
+        self.run_id = run_id
+        self.prompt = prompt
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.finished_at = None
+        self.output = None
+        self.is_error = False
+        self.num_turns = 0
+        self.duration_ms = 0
+        self.turn_cost_usd = 0.0
+        self.usage = {}
+        self.tool_calls.clear()
+        self.errors.clear()
+
     def tools_used(self) -> list[str]:
         return [c.tool for c in self.tool_calls if c.phase == "post"]
 
     def absorb_result(self, result: Any) -> None:
         """Pull the fields we care about off a ResultMessage."""
+        # Read before the overwrite below: the CLI's `total_cost_usd` is cumulative for
+        # its whole session, so on turn N it already contains turns 1..N-1. The delta is
+        # the only per-turn cost that exists, and without it a session's turns are
+        # indistinguishable from one expensive run repeated.
+        previous_cost = self.total_cost_usd
         self.finished_at = datetime.now(timezone.utc).isoformat()
         self.session_id = getattr(result, "session_id", None)
         self.output = getattr(result, "result", None)
@@ -80,6 +119,10 @@ class RunRecord:
         self.num_turns = getattr(result, "num_turns", 0) or 0
         self.duration_ms = getattr(result, "duration_ms", 0) or 0
         self.total_cost_usd = getattr(result, "total_cost_usd", 0.0) or 0.0
+        # max(0, ...) because a one-shot run starts at 0.0 (delta == total) and because
+        # a CLI that ever reported a lower cumulative than the previous turn should read
+        # as "no idea", not as a negative charge.
+        self.turn_cost_usd = max(0.0, self.total_cost_usd - previous_cost)
         self.usage = getattr(result, "usage", None) or {}
         self.errors = list(getattr(result, "errors", None) or [])
 

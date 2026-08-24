@@ -17,8 +17,12 @@ route:
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import subprocess
+import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from secrets import compare_digest
 from typing import Annotated, Any, Protocol
@@ -74,6 +78,48 @@ def make_runner(settings: Settings, project_root: Path) -> Runner:
     return _run
 
 
+def _child_process(agent: Any) -> Any | None:
+    """The SDK's CLI subprocess handle, or `None` if that shape has moved.
+
+    Three private attributes deep into a third-party package, which is as fragile as it
+    looks -- so every failure in here is `None` and no backstop, never an exception on a
+    path whose whole job is to be the last line of defence. It buys the one thing the
+    public API cannot: an object to ask about the child *after* `disconnect()` has
+    dropped its own reference to it.
+    """
+    try:
+        return agent._client._transport._process  # noqa: SLF001
+    except Exception:  # noqa: BLE001 - a missing backstop beats a raising one
+        return None
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Kill a CLI child and everything it spawned. Synchronous, never raises.
+
+    Tree, not process, on Windows: a `claude` CLI running in team mode has children of
+    its own, and killing only the parent re-parents them with their model sessions still
+    open -- which is how "the server would not stop" becomes "my account is rate
+    limited" on a machine where nothing appears to be running any more.
+
+    `os.kill`, not `os.killpg`, on POSIX. The SDK does not start the child in a new
+    session, so its process group is *ours*: `killpg(getpgid(pid))` would take down the
+    server, and quite possibly the shell that launched it.
+    """
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        else:
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+    except Exception as exc:  # noqa: BLE001 - a backstop that raises is worse than none
+        log.warning("api.session.child_kill_failed", pid=pid, error=str(exc))
+
+
 class _AgentConversation:
     """Adapts `runner.Agent` to the `Conversation` protocol.
 
@@ -82,17 +128,59 @@ class _AgentConversation:
     by hand here. `SessionStore` is what guarantees the exit happens: every path out of
     a session (`DELETE`, a failed turn, the idle reaper, shutdown) goes through
     `SessionStore.close`, which calls `aclose` exactly once.
+
+    That guarantee covers the *call*, not its completion, which is why this class also
+    holds the child process handle. See `_kill_if_orphaned`.
     """
 
     def __init__(self, agent: Any) -> None:
         self._agent = agent
+        # Captured now rather than in `aclose`: `disconnect()` sets the transport to
+        # `None` before it returns, so by the time we want to check on the child there
+        # is nothing left to ask. Holding the process object rather than the bare pid is
+        # what makes the backstop safe -- `returncode` separates "we never reaped it"
+        # from "it exited and the OS may have reissued that number to someone else".
+        self._process = _child_process(agent)
 
     async def send(self, prompt: str) -> RunRecord:
         record: RunRecord = await self._agent.ask(prompt)
         return record
 
     async def aclose(self) -> None:
-        await self._agent.__aexit__(None, None, None)
+        try:
+            await self._agent.__aexit__(None, None, None)
+        finally:
+            self._kill_if_orphaned()
+
+    def _kill_if_orphaned(self) -> None:
+        """Last resort: make sure the CLI child is actually gone.
+
+        Deliberately synchronous, in a `finally`, containing no await at all. That is
+        the entire point of it. `SubprocessCLITransport.close()` documents that its
+        shield only defers cancellation originating from an *anyio* cancel scope; a raw
+        asyncio cancellation -- uvicorn cancelling a request task because the browser
+        hung up, or the loop shutting down under Ctrl-C -- is still delivered at the next
+        await inside that teardown, and the terminate/kill escalation sitting below that
+        await is skipped. The child then survives its own close. Anything cancellable is
+        therefore useless here; a sync `finally` runs even while `CancelledError` is
+        propagating, and that is the only property this needs to have.
+
+        A no-op on every healthy path: `aclose` reaps the child, `returncode` is set, and
+        this returns without doing anything. The log line firing at all is the signal
+        that a teardown was cut short.
+        """
+        process = self._process
+        self._process = None
+        if process is None:
+            return
+        try:
+            if process.returncode is not None:
+                return
+            pid = int(process.pid)
+        except Exception:  # noqa: BLE001 - see `_child_process`
+            return
+        log.warning("api.session.child_orphaned", pid=pid)
+        _kill_process_tree(pid)
 
 
 def make_conversation_factory(settings: Settings, project_root: Path) -> ConversationFactory:

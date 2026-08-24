@@ -13,7 +13,10 @@ that belongs in `evals/`.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator
+from contextlib import suppress
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -22,9 +25,9 @@ import pytest
 from agency.agents.definitions import AGENTS
 from agency.agents.team import TEAM
 from agency.api.app import create_app
-from agency.api.deps import get_runner, get_slots
+from agency.api.deps import _AgentConversation, get_runner, get_slots
 from agency.api.errors import CONTENT_TYPE
-from agency.api.sessions import Conversation
+from agency.api.sessions import Conversation, SessionStore
 from agency.config import Profile, Settings
 from agency.obs.agent_state import REGISTRY
 from agency.obs.cost import RunRecord, ToolCall
@@ -65,11 +68,14 @@ class FakeRunner:
         self.record = record or _finished_record()
         self.delay = delay
         self.calls: list[dict[str, Any]] = []
+        # Which task the run actually executed in. See the timeout-mechanism tests.
+        self.tasks: list[Any] = []
 
     async def __call__(
         self, prompt: str, *, profile: Profile | None = None, team: bool = False
     ) -> RunRecord:
         self.calls.append({"prompt": prompt, "profile": profile, "team": team})
+        self.tasks.append(asyncio.current_task())
         if self.delay:
             await asyncio.sleep(self.delay)
         return self.record
@@ -90,20 +96,28 @@ class FakeConversation:
         delay: float = 0.0,
         boom: str = "",
         auth_fail: bool = False,
+        close_delay: float = 0.0,
     ) -> None:
         self.profile = profile
         self.team = team
         self.delay = delay
         self.boom = boom
+        # Teardown is slow and can fail independently of the turn: the SDK bounds its
+        # own close at ~20s, which is what makes a sequential `aclose_all` a problem.
+        self.close_delay = close_delay
+        self.close_boom = ""
         # Distinct from `boom`: a credential failure is a turn that *completed* and
         # returned an errored record, not a transport exception. The two take different
         # paths through the route and only one of them may close the session.
         self.auth_fail = auth_fail
         self.prompts: list[str] = []
         self.closed = 0
+        # Which task the turn actually executed in. See the timeout-mechanism tests.
+        self.tasks: list[Any] = []
 
     async def send(self, prompt: str) -> RunRecord:
         self.prompts.append(prompt)
+        self.tasks.append(asyncio.current_task())
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.boom:
@@ -113,23 +127,40 @@ class FakeConversation:
         return _finished_record(run_id=f"turn{len(self.prompts)}", prompt=prompt)
 
     async def aclose(self) -> None:
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
         # Counted, not flagged: a store that closed a session twice would leak nothing
-        # but would mean `close` is running on a path nobody reasoned about.
+        # but would mean `close` is running on a path nobody reasoned about. Counted
+        # *before* the raise, so "we tried" stays assertable for a wedged teardown.
         self.closed += 1
+        if self.close_boom:
+            raise RuntimeError(self.close_boom)
 
 
 class FakeConversations:
     """Stands in for `deps.make_conversation_factory`. Records what was opened."""
 
-    def __init__(self, delay: float = 0.0, boom: str = "", auth_fail: bool = False) -> None:
+    def __init__(
+        self,
+        delay: float = 0.0,
+        boom: str = "",
+        auth_fail: bool = False,
+        close_delay: float = 0.0,
+    ) -> None:
         self.delay = delay
         self.boom = boom
         self.auth_fail = auth_fail
+        self.close_delay = close_delay
         self.opened: list[FakeConversation] = []
 
     async def __call__(self, *, profile: Profile, team: bool = False) -> Conversation:
         conversation = FakeConversation(
-            profile, team, delay=self.delay, boom=self.boom, auth_fail=self.auth_fail
+            profile,
+            team,
+            delay=self.delay,
+            boom=self.boom,
+            auth_fail=self.auth_fail,
+            close_delay=self.close_delay,
         )
         self.opened.append(conversation)
         return conversation
@@ -1076,3 +1107,263 @@ async def test_an_error_response_carries_exactly_one_request_id(
     response = await client.post("/v1/runs", json={}, headers={"x-request-id": "trace-abc"})
     assert response.status_code == 422
     assert response.headers["x-request-id"] == "trace-abc"
+
+
+# --- session teardown ----------------------------------------------------------------
+# Every lifecycle test above ends with someone asking the server a question. These are
+# about the case where nobody does. Both were live failures: a frontend whose "close"
+# sent a prompt instead of a DELETE left a CLI subprocess running indefinitely, and
+# Ctrl-C then appeared to hang while the survivors were torn down one at a time.
+#
+# None of this is reachable through `client`: the reaper task and `aclose_all` belong to
+# the lifespan, and `httpx.ASGITransport` never runs lifespan events. So these drive the
+# store directly -- the same reason `SessionStore.reap` stayed independently callable.
+
+
+def _store(conversations: Any, idle_ttl_s: float = 0.05, limit: int = 8) -> SessionStore:
+    return SessionStore(conversations, limit=limit, idle_ttl_s=idle_ttl_s)
+
+
+async def _drain(store: SessionStore, interval: float = 0.01, tries: int = 200) -> None:
+    """Run the reaper until the store empties, then stop it."""
+    reaper = asyncio.create_task(store.reap_forever(interval))
+    try:
+        for _ in range(tries):
+            await asyncio.sleep(interval)
+            if store.count == 0:
+                return
+    finally:
+        reaper.cancel()
+        with suppress(asyncio.CancelledError):
+            await reaper
+
+
+async def test_the_reaper_collects_a_session_nobody_asks_about() -> None:
+    # The whole point of the timer. Nothing touches the store after `open`, which is
+    # exactly the state a client that closed its tab leaves behind -- and the state in
+    # which the lazy reap in open/get/list never runs, so the TTL is never once
+    # evaluated and the subprocess outlives everything.
+    conversations = FakeConversations()
+    store = _store(conversations)
+    session = await store.open(profile="sandboxed")
+    await _drain(store)
+    assert store.count == 0
+    assert session.closed
+    assert conversations.opened[0].closed == 1
+
+
+async def test_the_reaper_does_not_die_on_a_failed_reap() -> None:
+    # A reaper that dies is indistinguishable from no reaper at all, and the symptom
+    # arrives hours later as a machine full of CLI subprocesses. One bad pass must not
+    # be able to end the loop.
+    conversations = FakeConversations()
+    store = _store(conversations)
+    await store.open(profile="sandboxed")
+    passes = 0
+    real_reap = store.reap
+
+    async def flaky() -> None:
+        nonlocal passes
+        passes += 1
+        if passes == 1:
+            raise RuntimeError("the first pass blew up")
+        await real_reap()
+
+    store.reap = flaky  # type: ignore[method-assign]
+    await _drain(store)
+    assert passes > 1
+    assert store.count == 0
+    assert conversations.opened[0].closed == 1
+
+
+async def test_the_reaper_does_not_run_when_the_ttl_is_disabled() -> None:
+    store = _store(FakeConversations(), idle_ttl_s=0.0)
+    assert store.reap_interval_s == 0.0
+    # Returns rather than looping forever: a disabled TTL means "hold sessions until
+    # someone asks", and a task that woke only to do nothing would be a lie in a trace.
+    await asyncio.wait_for(store.reap_forever(), timeout=1.0)
+
+
+def test_the_reap_interval_is_derived_and_clamped() -> None:
+    # A quarter of the TTL, floored so a tiny TTL cannot make this a busy loop and
+    # capped so a long one is still checked within a minute of expiry.
+    assert _store(FakeConversations(), idle_ttl_s=900.0).reap_interval_s == 60.0
+    assert _store(FakeConversations(), idle_ttl_s=40.0).reap_interval_s == 10.0
+    assert _store(FakeConversations(), idle_ttl_s=0.05).reap_interval_s == 1.0
+
+
+async def test_shutdown_closes_sessions_at_once_not_one_at_a_time() -> None:
+    # The assertion that matters is the wall clock -- "they all closed" was already true
+    # of the sequential version. The SDK bounds each teardown at roughly twenty seconds,
+    # so sequentially a full box is minutes of a terminal that looks hung after Ctrl-C,
+    # with the second Ctrl-C unable to get through the SDK's shielded close.
+    conversations = FakeConversations(close_delay=0.2)
+    store = _store(conversations, idle_ttl_s=0.0)
+    for _ in range(5):
+        await store.open(profile="sandboxed")
+    started = time.perf_counter()
+    await store.aclose_all()
+    elapsed = time.perf_counter() - started
+    assert store.count == 0
+    assert all(c.closed == 1 for c in conversations.opened)
+    assert elapsed < 0.5, f"closed sequentially: {elapsed:.2f}s for 5 x 0.2s"
+
+
+async def test_one_wedged_teardown_does_not_strand_the_rest() -> None:
+    # `close` already logs and swallows, so an exception reaching `aclose_all` is a bug
+    # in the bookkeeping -- and aborting the gather would leave the remaining sessions
+    # open, which is the exact leak the method exists to prevent.
+    conversations = FakeConversations()
+    store = _store(conversations, idle_ttl_s=0.0)
+    for _ in range(3):
+        await store.open(profile="sandboxed")
+    conversations.opened[0].close_boom = "wedged"
+    await store.aclose_all()
+    assert store.count == 0
+    assert all(c.closed == 1 for c in conversations.opened)
+
+
+# --- the orphan backstop -------------------------------------------------------------
+# `_AgentConversation` is the only object in `api/` that holds an SDK handle, so it is
+# the only place that can tell whether the CLI child actually died. It has to, because
+# `SubprocessCLITransport.close()` shields its own teardown and an anyio shield does not
+# defer a *raw* asyncio cancellation -- uvicorn cancelling a request task when the
+# browser hangs up, or the loop shutting down under Ctrl-C. The escalation that kills the
+# child is then skipped. The backstop is synchronous for exactly that reason.
+
+
+class FakeProcess:
+    def __init__(self, pid: int = 4242, returncode: int | None = None) -> None:
+        self.pid = pid
+        self.returncode = returncode
+
+
+class FakeAgent:
+    """The attribute chain `_child_process` reaches through, plus an exit that can fail."""
+
+    def __init__(self, process: Any, boom: BaseException | None = None) -> None:
+        self._client = SimpleNamespace(_transport=SimpleNamespace(_process=process))
+        self._boom = boom
+        self.exited = 0
+
+    async def __aexit__(self, *_exc: object) -> None:
+        self.exited += 1
+        if self._boom is not None:
+            raise self._boom
+
+
+class ShapelessAgent:
+    """No `_client`. Stands in for the day the SDK's internals move."""
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+
+@pytest.fixture
+def killed(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    pids: list[int] = []
+    monkeypatch.setattr("agency.api.deps._kill_process_tree", pids.append)
+    return pids
+
+
+async def test_a_clean_teardown_kills_nothing(killed: list[int]) -> None:
+    agent = FakeAgent(FakeProcess(returncode=0))
+    await _AgentConversation(agent).aclose()
+    assert agent.exited == 1
+    assert killed == []
+
+
+async def test_a_child_that_outlived_its_own_close_is_killed(killed: list[int]) -> None:
+    # `returncode is None` means nothing reaped it, so the pid is still ours and cannot
+    # have been reissued to an unrelated process.
+    await _AgentConversation(FakeAgent(FakeProcess())).aclose()
+    assert killed == [4242]
+
+
+async def test_the_backstop_runs_even_when_the_teardown_is_cancelled(
+    killed: list[int],
+) -> None:
+    # The reason it is a synchronous `finally` and not an await: this runs while
+    # CancelledError is propagating, which is precisely what the SDK's shield cannot
+    # promise when the cancellation came from asyncio rather than from anyio.
+    conversation = _AgentConversation(FakeAgent(FakeProcess(), boom=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await conversation.aclose()
+    assert killed == [4242]
+
+
+async def test_the_backstop_runs_when_the_teardown_raises(killed: list[int]) -> None:
+    conversation = _AgentConversation(FakeAgent(FakeProcess(), boom=RuntimeError("wedged")))
+    with pytest.raises(RuntimeError):
+        await conversation.aclose()
+    assert killed == [4242]
+
+
+async def test_losing_the_backstop_does_not_break_the_teardown(killed: list[int]) -> None:
+    # Three private attributes deep into a third-party package. When that stops
+    # resolving, silently having no backstop is the correct failure; raising in the
+    # middle of a close is not, because the close is what everything else depends on.
+    await _AgentConversation(ShapelessAgent()).aclose()
+    assert killed == []
+
+
+async def test_the_lifespan_owns_the_reaper_and_closes_what_is_left(
+    api_settings: Settings,
+) -> None:
+    # The wiring itself, driven directly. `httpx.ASGITransport` never runs lifespan
+    # events, so no other test in this file can tell whether the reaper is actually
+    # started, whether it is cancelled again, or whether shutdown closes the sessions the
+    # process was still holding -- and "the container stopped without orphaning one
+    # subprocess per open session" is the only thing this lifespan is for.
+    conversations = FakeConversations()
+    app = create_app(api_settings, runner=FakeRunner(), conversation_factory=conversations)
+    store = app.state.sessions
+    async with app.router.lifespan_context(app):
+        assert "agency.session-reaper" in {t.get_name() for t in asyncio.all_tasks()}
+        await store.open(profile="sandboxed")
+        assert store.count == 1
+    assert store.count == 0
+    assert conversations.opened[0].closed == 1
+    # Cancelled, not merely abandoned: a loop that outlived its app would hold a store
+    # nothing can reach and keep waking up to reap it.
+    assert "agency.session-reaper" not in {t.get_name() for t in asyncio.all_tasks()}
+
+
+# --- how the timeout cancels ---------------------------------------------------------
+# Not "does it time out" -- that is asserted above -- but *how*, which is the difference
+# between a reaped CLI subprocess and an orphaned one.
+#
+# `asyncio.wait_for` runs the awaitable in a child task and cancels that task, which is a
+# raw asyncio cancellation. `SubprocessCLITransport.close()` documents that its shield
+# only defers cancellation originating from an anyio cancel scope, so a raw one is
+# delivered at the first await of the teardown and the terminate -> kill escalation below
+# it never runs: the child survives the timeout that existed to reap it. An anyio scope
+# cancels the task in place instead, the shield holds, and the child dies.
+#
+# A fake cannot show the surviving subprocess, so these assert the mechanism that decides
+# it: same task means the cancellation came from a scope, a child task means `wait_for`.
+# Sound only because this app's middleware is pure ASGI -- `BaseHTTPMiddleware` would run
+# the route in a task of its own and this would be comparing two unrelated tasks. See
+# `api/middleware.py` for why it is not used.
+
+
+async def test_a_turn_is_cancelled_in_place_not_through_a_wrapper_task(
+    api_settings: Settings,
+) -> None:
+    conversations = FakeConversations()
+    async with make_client(api_settings, FakeRunner(), conversations) as c:
+        session = await _open(c)
+        here = asyncio.current_task()
+        response = await c.post(f"/v1/sessions/{session['id']}/messages", json={"prompt": "x"})
+        assert response.status_code == 200
+        assert conversations.opened[0].tasks == [here]
+
+
+async def test_a_run_is_cancelled_in_place_not_through_a_wrapper_task(
+    api_settings: Settings,
+) -> None:
+    runner = FakeRunner()
+    async with make_client(api_settings, runner) as c:
+        here = asyncio.current_task()
+        assert (await c.post("/v1/runs", json={"prompt": "x"})).status_code == 200
+        assert runner.tasks == [here]

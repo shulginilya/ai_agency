@@ -84,9 +84,10 @@ class Agent:
         if self._client is None or self.record is None:
             raise RuntimeError("Agent must be used as an async context manager.")
 
-        self.record.run_id = _new_run_id()
-        self.record.prompt = prompt
-        self.record.tool_calls.clear()
+        # One call, so the list of per-turn fields lives next to the dataclass that
+        # owns them: a field added to `RunRecord` and forgotten here used to mean turn
+        # two silently reporting turn one's numbers.
+        self.record.reset_for_turn(_new_run_id(), prompt)
 
         with run_context(self.record.run_id):
             log.info("run.start", profile=self.profile, prompt=prompt[:200])
