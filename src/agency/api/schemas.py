@@ -11,7 +11,7 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agency.api.sessions import Session
 from agency.config import Profile
@@ -38,10 +38,30 @@ class RunRequest(BaseModel):
         default=None,
         description="Override the server's configured profile for this run.",
     )
-    team: bool = Field(
-        default=False,
-        description="Run the manager agent, which may delegate to the workers in agents/team.py.",
+    team: str | None = Field(
+        default=None,
+        description=(
+            "Name of a team from agents/team.py to run as manager+workers instead of the "
+            "solo agent, e.g. 'engineering'. Omit or null for a solo agent. See "
+            "GET /v1/agents for the current roster, grouped by team."
+        ),
     )
+
+    @field_validator("team")
+    @classmethod
+    def _validate_team(cls, value: str | None) -> str | None:
+        # Deferred import: this class must stay importable without the SDK (see
+        # `_roster_entries` below for the same reasoning), and validators only run
+        # when a request actually carries a `team`, so the cost is paid once, on
+        # first use, not at import time.
+        if value is None:
+            return value
+        from agency.agents.team import TEAMS
+
+        if value not in TEAMS:
+            known = ", ".join(sorted(TEAMS))
+            raise ValueError(f"unknown team {value!r}. known teams: {known}")
+        return value
 
 
 class ToolEvent(BaseModel):
@@ -103,13 +123,26 @@ class SessionCreateRequest(BaseModel):
         default=None,
         description="Pin the profile for the whole session. Fixed at open time.",
     )
-    team: bool = Field(
-        default=False,
+    team: str | None = Field(
+        default=None,
         description=(
-            "Open the session as the manager agent, which may delegate to the workers "
-            "in agents/team.py. Fixed at open time."
+            "Name of a team from agents/team.py to open the session as, instead of the "
+            "solo agent, e.g. 'engineering'. Omit or null for a solo agent. Fixed at "
+            "open time -- see MessageRequest."
         ),
     )
+
+    @field_validator("team")
+    @classmethod
+    def _validate_team(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        from agency.agents.team import TEAMS
+
+        if value not in TEAMS:
+            known = ", ".join(sorted(TEAMS))
+            raise ValueError(f"unknown team {value!r}. known teams: {known}")
+        return value
 
 
 class MessageRequest(BaseModel):
@@ -136,7 +169,9 @@ class SessionInfo(BaseModel):
 
     id: str = Field(description="Opaque handle. Mint it here; do not construct one.")
     profile: str = Field(description="Profile the session connected with. Fixed for its life.")
-    team: bool = Field(description="Whether this session runs the manager agent.")
+    team: str | None = Field(
+        description="Team this session runs as manager+workers, or null for a solo agent."
+    )
     status: SessionStatus = Field(
         description=(
             "'busy' while a turn is in flight. A message sent to a busy session is a "
@@ -256,7 +291,7 @@ class AgentStatus(str, Enum):
         return cls.IDLE
 
 
-def _roster_entries() -> list[tuple[str, AgentDefinition, Availability]]:
+def _roster_entries() -> list[tuple[str, AgentDefinition, Availability, str | None]]:
     """The full roster, flattened and ordered, in one place.
 
     Both the collection and the single-agent lookup read this, so an agent that shows up
@@ -264,27 +299,32 @@ def _roster_entries() -> list[tuple[str, AgentDefinition, Availability]]:
     the rosters would eventually disagree, and that disagreement is invisible in tests
     that only exercise one of them.
 
+    The fourth element is the owning team name, or `None` for an always-available
+    agent. Worker names must stay unique across `AGENTS` and every team in `TEAMS` --
+    `tests/test_team.py` pins that -- because this list is built by concatenation and a
+    repeated name would make `from_name` silently return whichever entry came first.
+
     The rosters are imported here, not at module scope: `agency.agents.*` pulls in the
     SDK, and `agency.api` stays importable without it (`--help`, OpenAPI generation).
     Same reason `deps.make_runner` defers its import.
     """
     from agency.agents.definitions import AGENTS
-    from agency.agents.team import TEAM
+    from agency.agents.team import TEAMS
 
-    rosters: tuple[tuple[dict[str, AgentDefinition], Availability], ...] = (
-        (AGENTS, "always"),
-        (TEAM, "team"),
-    )
-    return [
-        (name, roster[name], availability)
-        for roster, availability in rosters
-        for name in sorted(roster)
+    entries: list[tuple[str, AgentDefinition, Availability, str | None]] = [
+        (name, AGENTS[name], "always", None) for name in sorted(AGENTS)
     ]
+    for team_name in sorted(TEAMS):
+        workers = TEAMS[team_name].workers
+        entries += [
+            (name, workers[name], "team", team_name) for name in sorted(workers)
+        ]
+    return entries
 
 
 def known_agent_names() -> list[str]:
     """Every invocable agent name, in response order. Used to make a 404 actionable."""
-    return [name for name, _definition, _availability in _roster_entries()]
+    return [name for name, _definition, _availability, _team in _roster_entries()]
 
 
 class AgentInfo(BaseModel):
@@ -329,8 +369,15 @@ class AgentInfo(BaseModel):
     availability: Availability = Field(
         description=(
             "'always' -- loaded on every run. 'team' -- only present when the run is "
-            "started with team=true."
+            "started with team=<name>; see the `team` field for which one."
         )
+    )
+    team: str | None = Field(
+        default=None,
+        description=(
+            "Name of the team this worker belongs to, or null for an always-available "
+            "agent. Pass this as `team` on POST /v1/runs or POST /v1/sessions to reach it."
+        ),
     )
     updated_at: datetime = Field(
         description=(
@@ -352,6 +399,7 @@ class AgentInfo(BaseModel):
         name: str,
         definition: AgentDefinition,
         availability: Availability,
+        team: str | None,
         state: AgentState,
     ) -> AgentInfo:
         # Two sources, joined here: `definition` is static config, `state` is live and
@@ -370,6 +418,7 @@ class AgentInfo(BaseModel):
             tools=definition.tools,
             max_turns=definition.maxTurns,
             availability=availability,
+            team=team,
             updated_at=state.updated_at,
             invocations=state.invocations,
         )
@@ -384,13 +433,13 @@ class AgentInfo(BaseModel):
         manager invokes, and the SDK does not fold it either. Resolving 'Critic' here
         would hand back an agent that `POST /v1/runs` cannot actually reach.
         """
-        for entry_name, definition, availability in _roster_entries():
+        for entry_name, definition, availability, team in _roster_entries():
             if entry_name != name:
                 continue
             # Snapshot only once we know we are returning something. Same source as the
             # list endpoint, so the two cannot report different statuses for one agent.
             state = REGISTRY.snapshot().get(name, REGISTRY.default_state())
-            return cls.from_definition(entry_name, definition, availability, state)
+            return cls.from_definition(entry_name, definition, availability, team, state)
         return None
 
 
@@ -398,8 +447,8 @@ class AgentsResponse(BaseModel):
     """Body of `GET /v1/agents`: the subagent roster.
 
     Only subagents are listed. The manager is not one -- it is the main thread agent you
-    talk to, so it has no name to invoke and nothing to discover; `team=true` on
-    `POST /v1/runs` is what selects it. See `agents/team.py`.
+    talk to, so it has no name to invoke and nothing to discover; `team=<name>` on
+    `POST /v1/runs` is what selects it and its workers. See `agents/team.py`.
 
     Kept an envelope rather than a bare array so fields can be added without breaking
     clients, and because a top-level JSON array is awkward to extend.
@@ -426,8 +475,10 @@ class AgentsResponse(BaseModel):
         # timestamp on every poll and look like it had just done something.
         unseen = REGISTRY.default_state()
         agents = [
-            AgentInfo.from_definition(name, definition, availability, states.get(name, unseen))
-            for name, definition, availability in _roster_entries()
+            AgentInfo.from_definition(
+                name, definition, availability, team, states.get(name, unseen)
+            )
+            for name, definition, availability, team in _roster_entries()
         ]
         return cls(agents=agents, count=len(agents))
 

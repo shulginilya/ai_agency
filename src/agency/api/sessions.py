@@ -83,7 +83,7 @@ class Conversation(Protocol):
 class ConversationFactory(Protocol):
     """Opens a `Conversation`. `deps.make_conversation_factory` is the production one."""
 
-    async def __call__(self, *, profile: Profile, team: bool = False) -> Conversation: ...
+    async def __call__(self, *, profile: Profile, team: str | None = None) -> Conversation: ...
 
 
 @dataclass
@@ -98,7 +98,7 @@ class Session:
 
     id: str
     profile: Profile
-    team: bool
+    team: str | None
     conversation: Conversation
     idle_ttl_s: float
     created_at: datetime = field(default_factory=_now)
@@ -160,7 +160,7 @@ class SessionStore:
     def available(self) -> int:
         return max(0, self.limit - self.count - self._opening)
 
-    async def open(self, *, profile: Profile, team: bool = False) -> Session:
+    async def open(self, *, profile: Profile, team: str | None = None) -> Session:
         """Connect a new session, or refuse with 503 if the box is full."""
         await self.reap()
         if self.count + self._opening >= self.limit:

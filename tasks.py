@@ -86,11 +86,16 @@ def repl(rest: Sequence[str]) -> None:
 
 
 def team(rest: Sequence[str]) -> None:
-    """Talk to the manager agent.  task team "your prompt here" """
+    """Talk to the manager agent.  task team "your prompt" [--team NAME] """
     if not rest:
-        print('usage: task team "your prompt"', file=sys.stderr)
+        print('usage: task team "your prompt" [--team NAME]', file=sys.stderr)
         sys.exit(2)
     run("agency", "team", *rest)
+
+
+def teams(rest: Sequence[str]) -> None:
+    """List available teams and their workers."""
+    run("agency", "teams", *rest)
 
 
 def serve(rest: Sequence[str]) -> None:
@@ -168,6 +173,7 @@ TASKS: dict[str, Callable[[Sequence[str]], None]] = {
     "run": agent_run,
     "repl": repl,
     "team": team,
+    "teams": teams,
     "serve": serve,
     "doctor": doctor,
     "lint": lint,

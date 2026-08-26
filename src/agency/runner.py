@@ -44,7 +44,7 @@ class Agent:
         settings: Settings | None = None,
         project_root: Path | None = None,
         emit: Emit | None = None,
-        team: bool = False,
+        team: str | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.profile: Profile = profile or self.settings.profile
@@ -135,7 +135,7 @@ async def run_once(
     settings: Settings | None = None,
     project_root: Path | None = None,
     emit: Emit | None = None,
-    team: bool = False,
+    team: str | None = None,
 ) -> RunRecord:
     """One-shot convenience wrapper."""
     async with Agent(
