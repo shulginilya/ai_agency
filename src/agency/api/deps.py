@@ -54,7 +54,7 @@ class Runner(Protocol):
     """
 
     async def __call__(
-        self, prompt: str, *, profile: Profile | None = None, team: bool = False
+        self, prompt: str, *, profile: Profile | None = None, team: str | None = None
     ) -> RunRecord: ...
 
 
@@ -66,7 +66,9 @@ def make_runner(settings: Settings, project_root: Path) -> Runner:
     """
     from agency.runner import run_once
 
-    async def _run(prompt: str, *, profile: Profile | None = None, team: bool = False) -> RunRecord:
+    async def _run(
+        prompt: str, *, profile: Profile | None = None, team: str | None = None
+    ) -> RunRecord:
         return await run_once(
             prompt,
             profile=profile or settings.profile,
@@ -194,7 +196,7 @@ def make_conversation_factory(settings: Settings, project_root: Path) -> Convers
     """
     from agency.runner import Agent
 
-    async def _open(*, profile: Profile, team: bool = False) -> Conversation:
+    async def _open(*, profile: Profile, team: str | None = None) -> Conversation:
         agent = Agent(
             profile=profile,
             settings=settings,

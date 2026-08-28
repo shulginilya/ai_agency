@@ -10,7 +10,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from agency.agents.team import TEAM
+from agency.agents.team import TEAMS, get_team
 from agency.config import AuthSource, Profile, get_settings
 from agency.hooks.delegation import delegations
 from agency.obs.cost import RunRecord
@@ -197,6 +197,14 @@ def doctor() -> None:
 @app.command()
 def team(
     prompt: Annotated[str, typer.Argument(help="What the manager should get done.")],
+    team_name: Annotated[
+        str | None,
+        typer.Option(
+            "--team",
+            "-t",
+            help="Which team to run as manager+workers. See `agency teams`.",
+        ),
+    ] = None,
     profile: Annotated[str | None, typer.Option("--profile", "-p")] = None,
     thinking: Annotated[bool, typer.Option("--thinking")] = False,
     interactive: Annotated[
@@ -204,22 +212,32 @@ def team(
         typer.Option("--interactive", "-i", help="Stay in session after the first turn."),
     ] = False,
 ) -> None:
-    """Talk to the manager agent. It delegates to the workers in `agents/team.py`.
+    """Talk to a manager agent. It delegates to the workers of the selected team.
 
     The manager is the main thread -- you are talking to it directly. Workers only
-    exist inside Agent tool calls (magenta arrows in the output).
+    exist inside Agent tool calls (magenta arrows in the output). Defaults to the
+    server's configured default team (`AGENCY_DEFAULT_TEAM`); run `agency teams` to
+    see what is available.
     """
+    settings = get_settings()
     active = _setup(profile)
+    selected = team_name or settings.default_team
+    try:
+        team_def = get_team(selected)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
     emit = _make_emit(thinking)
-    roster = ", ".join(sorted(TEAM))
+    roster = ", ".join(sorted(team_def.workers))
 
     async def loop() -> None:
         async with Agent(
-            profile=active, project_root=Path.cwd(), emit=emit, team=True
+            profile=active, project_root=Path.cwd(), emit=emit, team=selected
         ) as agent:
             console.print(
                 Panel(
-                    f"profile: [bold]{active}[/bold]  |  workers: [bold]{roster}[/bold]",
+                    f"profile: [bold]{active}[/bold]  |  team: [bold]{selected}[/bold]  |  "
+                    f"workers: [bold]{roster}[/bold]",
                     title="agency team",
                     expand=False,
                 )
@@ -249,6 +267,16 @@ def _report(record: RunRecord) -> None:
             expand=False,
         )
     )
+
+
+@app.command()
+def teams() -> None:
+    """List the teams a manager can run as, and each one's workers."""
+    default = get_settings().default_team
+    for name, definition in sorted(TEAMS.items()):
+        roster = ", ".join(sorted(definition.workers)) or "[dim]none[/dim]"
+        label = f"team: {name}" + ("  [dim](default)[/dim]" if name == default else "")
+        console.print(Panel(f"workers: {roster}", title=label, expand=False))
 
 
 if __name__ == "__main__":

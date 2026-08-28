@@ -251,7 +251,11 @@ def test_from_definition_takes_state_explicitly() -> None:
     # "idle" for an agent that is running.
     from agency.agents.team import TEAM
 
-    info = AgentInfo.from_definition("reviewer", TEAM["reviewer"], "team", AgentState(active=2))
+    info = AgentInfo.from_definition(
+        "reviewer", TEAM["reviewer"], "team", "engineering", AgentState(active=2)
+    )
     assert info.status is AgentStatus.RUNNING
     with pytest.raises(TypeError):
-        AgentInfo.from_definition("reviewer", TEAM["reviewer"], "team")  # type: ignore[call-arg]
+        AgentInfo.from_definition(  # type: ignore[call-arg]
+            "reviewer", TEAM["reviewer"], "team", "engineering"
+        )

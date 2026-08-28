@@ -2,7 +2,7 @@
 
 The bugs these catch are the boring ones that cost you an afternoon: a worker that
 silently has Write access, a manager whose delegation tool isn't auto-approved, a
-`team=True` run that quietly used the solo prompt.
+`team=<name>` run that quietly used the solo prompt.
 """
 
 from __future__ import annotations
@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from agency.agents.team import MANAGER_PROMPT, TEAM
+from agency.agents.definitions import AGENTS
+from agency.agents.team import DEFAULT_TEAM, MANAGER_PROMPT, TEAM, TEAMS, get_team
 from agency.config import Settings
 from agency.hooks.delegation import DELEGATION_TOOL, delegations, make_subagent_start_hook
 from agency.obs.cost import RunRecord
@@ -76,7 +77,9 @@ def test_workers_are_turn_capped() -> None:
 def test_team_mode_attaches_workers_and_manager_prompt(
     settings: Settings, tmp_path: Path, profile: str
 ) -> None:
-    opts = build_options(profile, settings=settings, project_root=tmp_path, team=True)  # type: ignore[arg-type]
+    opts = build_options(
+        profile, settings=settings, project_root=tmp_path, team="engineering"  # type: ignore[arg-type]
+    )
     assert opts.agents is not None
     assert set(TEAM).issubset(opts.agents)
     assert opts.system_prompt == MANAGER_PROMPT
@@ -91,7 +94,7 @@ def test_solo_mode_is_unchanged(settings: Settings, tmp_path: Path) -> None:
 def test_team_mode_exposes_every_worker(settings: Settings, tmp_path: Path) -> None:
     # A worker defined in TEAM but never reachable from a run is the failure this
     # catches: the manager prompt advertises it and delegation then 404s.
-    opts = build_options("dev", settings=settings, project_root=tmp_path, team=True)
+    opts = build_options("dev", settings=settings, project_root=tmp_path, team="engineering")
     assert {"reviewer", "test-writer", "developer"}.issubset(set(opts.agents or {}))
 
 
@@ -107,12 +110,12 @@ def test_delegation_tool_is_auto_approved_under_both_names(
 ) -> None:
     # Miss either name and delegation falls through to a permission prompt, which
     # presents as "the manager refuses to delegate".
-    opts = build_options("dev", settings=settings, project_root=tmp_path, team=True)
+    opts = build_options("dev", settings=settings, project_root=tmp_path, team="engineering")
     assert {"Agent", "Task"}.issubset(set(opts.allowed_tools))
 
 
 def test_subagent_tree_is_capped(settings: Settings, tmp_path: Path) -> None:
-    opts = build_options("dev", settings=settings, project_root=tmp_path, team=True)
+    opts = build_options("dev", settings=settings, project_root=tmp_path, team="engineering")
     env = opts.env or {}
     assert env.get("CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH") == "1"
     assert int(env.get("CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS", "999")) <= 10
@@ -121,7 +124,7 @@ def test_subagent_tree_is_capped(settings: Settings, tmp_path: Path) -> None:
 def test_team_mode_does_not_relax_the_sandbox(settings: Settings, tmp_path: Path) -> None:
     # Orchestration and policy are orthogonal. A manager in `sandboxed` is still
     # sandboxed -- and so is every worker it spawns.
-    opts = build_options("sandboxed", settings=settings, project_root=tmp_path, team=True)
+    opts = build_options("sandboxed", settings=settings, project_root=tmp_path, team="engineering")
     assert "Write" not in opts.allowed_tools
     assert "Bash" not in opts.allowed_tools
     assert opts.can_use_tool is not None
@@ -130,7 +133,9 @@ def test_team_mode_does_not_relax_the_sandbox(settings: Settings, tmp_path: Path
 def test_delegation_hooks_registered_when_a_record_exists(
     settings: Settings, tmp_path: Path, record: RunRecord
 ) -> None:
-    opts = build_options("dev", record=record, settings=settings, project_root=tmp_path, team=True)
+    opts = build_options(
+        "dev", record=record, settings=settings, project_root=tmp_path, team="engineering"
+    )
     assert opts.hooks is not None
     assert opts.hooks["SubagentStart"] and opts.hooks["SubagentStop"]
 
@@ -153,3 +158,55 @@ async def test_delegation_trace_records_the_worker(record: RunRecord) -> None:
 
 async def test_no_delegations_reported_when_manager_did_it_itself(record: RunRecord) -> None:
     assert delegations(record) == []
+
+
+# --- multi-team registry -------------------------------------------------------------
+
+
+def test_default_team_is_a_real_team() -> None:
+    # `agency team` and `Settings.default_team` both fall back to this name; a typo here
+    # would make the CLI's own default unusable.
+    assert DEFAULT_TEAM in TEAMS
+
+
+def test_get_team_returns_the_named_team() -> None:
+    assert get_team("engineering").workers is TEAM
+    assert get_team("engineering").manager_prompt == MANAGER_PROMPT
+
+
+def test_get_team_rejects_an_unknown_name_with_the_full_roster() -> None:
+    with pytest.raises(ValueError, match="unknown team 'nope'.*engineering"):
+        get_team("nope")
+
+
+def test_worker_names_are_globally_unique_across_agents_and_teams() -> None:
+    # `api.schemas._roster_entries` builds one flat list by concatenating `AGENTS` with
+    # every team's workers; a repeated name would make `GET /v1/agents/{id}` silently
+    # resolve to whichever roster iterated first. Adding a team is adding an entry to
+    # `TEAMS`, so this is the guard that catches a name collision at that point rather
+    # than in production traffic.
+    seen: dict[str, str] = {name: "agents.definitions.AGENTS" for name in AGENTS}
+    for team_name, team_def in TEAMS.items():
+        for worker_name in team_def.workers:
+            owner = seen.get(worker_name)
+            assert owner is None, (
+                f"{worker_name!r} is defined in both {owner} and team {team_name!r} -- "
+                "worker names must be unique across the always-available roster and "
+                "every team"
+            )
+            seen[worker_name] = f"team {team_name!r}"
+
+
+def test_build_options_rejects_an_unknown_team(settings: Settings, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown team"):
+        build_options("dev", settings=settings, project_root=tmp_path, team="nope")
+
+
+def test_build_options_solo_mode_ignores_the_team_registry(
+    settings: Settings, tmp_path: Path
+) -> None:
+    # team=None (the default) must never consult TEAMS -- a solo run should behave
+    # identically whether or not any teams are registered.
+    opts = build_options("dev", settings=settings, project_root=tmp_path)
+    assert opts.system_prompt == SYSTEM_PROMPT
+    assert set(opts.agents or {}) == set(AGENTS)

@@ -15,7 +15,7 @@ from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 from claude_agent_sdk.types import HookEvent, PermissionMode
 
 from agency.agents.definitions import AGENTS
-from agency.agents.team import MANAGER_PROMPT, TEAM
+from agency.agents.team import get_team
 from agency.config import Profile, Settings, get_settings
 from agency.hooks.audit import (
     make_failure_audit_hook,
@@ -129,21 +129,26 @@ def build_options(
     record: RunRecord | None = None,
     settings: Settings | None = None,
     project_root: Path | None = None,
-    team: bool = False,
+    team: str | None = None,
 ) -> ClaudeAgentOptions:
     """Build the options for a run.
 
     `record` is threaded into the hooks so the tool trace lands on the run record.
 
-    `team=True` switches the main thread from solo agent to manager: it swaps in
-    MANAGER_PROMPT and adds the TEAM workers. Everything else -- profile, guardrails,
-    budget -- is unchanged, which is the point. Orchestration and policy are orthogonal;
-    a manager in `sandboxed` is still sandboxed, and so is every worker it spawns.
+    `team` names a `TeamDefinition` from `agents.team.TEAMS` and switches the main
+    thread from solo agent to that team's manager: it swaps in the team's manager
+    prompt and adds its workers. `None` (the default) is solo mode. An unknown name
+    raises `ValueError` from `get_team` -- caught by the CLI and turned into a 422 by
+    the API's request validators, so a typo'd team name never reaches the SDK.
+    Everything else -- profile, guardrails, budget -- is unchanged, which is the
+    point. Orchestration and policy are orthogonal; a manager in `sandboxed` is still
+    sandboxed, and so is every worker it spawns.
     """
     settings = settings or get_settings()
     profile = profile or settings.profile
     project_root = project_root or Path.cwd()
     workspace = settings.resolved_workspace()
+    team_def = get_team(team) if team else None
 
     allowed = [*READ_ONLY_TOOLS, *ALLOWED_CUSTOM_TOOLS]
     permission_mode: PermissionMode = "default"
@@ -184,7 +189,7 @@ def build_options(
 
     options = ClaudeAgentOptions(
         model=settings.model,
-        system_prompt=MANAGER_PROMPT if team else SYSTEM_PROMPT,
+        system_prompt=team_def.manager_prompt if team_def else SYSTEM_PROMPT,
         cwd=str(workspace),
         add_dirs=[str(project_root)] if profile != "sandboxed" else [],
         allowed_tools=allowed,
@@ -192,7 +197,7 @@ def build_options(
         permission_mode=permission_mode,
         can_use_tool=can_use_tool if permission_mode != "bypassPermissions" else None,
         hooks=hooks,
-        agents={**AGENTS, **TEAM} if team else AGENTS,
+        agents={**AGENTS, **team_def.workers} if team_def else AGENTS,
         mcp_servers=_load_mcp_servers(project_root),
         max_turns=max_turns,
         max_budget_usd=settings.max_budget_usd,

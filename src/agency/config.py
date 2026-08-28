@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     model: str = "claude-sonnet-5"
     eval_model: str = "claude-haiku-4-5-20251001"
 
+    # Which entry of `agents.team.TEAMS` `agency team`/a team-mode run falls back to
+    # when the caller does not name one explicitly. A plain str, not validated against
+    # the registry here: `config.py` is imported before the SDK-heavy `agents` package
+    # anywhere that needs to stay importable without it (see `api/schemas.py`'s deferred
+    # imports for why). `agents.team.get_team` is what actually enforces the name.
+    default_team: str = "engineering"
+
     # --- Agent credentials ----------------------------------------------------------
     # The only settings here that are NOT AGENCY_-prefixed, because they are not ours:
     # they are the variable names the Claude Code CLI subprocess reads. Declaring

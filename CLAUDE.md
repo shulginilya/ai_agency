@@ -95,7 +95,8 @@ add new commands to `tasks.py`, not to the Makefile, or the two will drift.
     python tasks.py install     # sync deps (uv if present, else pip -e ".[dev,api]")
     python tasks.py run "..."   # one-shot
     python tasks.py repl        # interactive session
-    python tasks.py team "..."  # manager + workers
+    python tasks.py team "..."  # manager + workers (--team NAME to pick a team)
+    python tasks.py teams        # list available teams and their workers
     python tasks.py serve       # HTTP API on AGENCY_API_HOST:AGENCY_API_PORT
     python tasks.py doctor      # print resolved config
     python tasks.py check       # lint + typecheck + test

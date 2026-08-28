@@ -72,7 +72,7 @@ class FakeRunner:
         self.tasks: list[Any] = []
 
     async def __call__(
-        self, prompt: str, *, profile: Profile | None = None, team: bool = False
+        self, prompt: str, *, profile: Profile | None = None, team: str | None = None
     ) -> RunRecord:
         self.calls.append({"prompt": prompt, "profile": profile, "team": team})
         self.tasks.append(asyncio.current_task())
@@ -92,7 +92,7 @@ class FakeConversation:
     def __init__(
         self,
         profile: Profile,
-        team: bool,
+        team: str | None,
         delay: float = 0.0,
         boom: str = "",
         auth_fail: bool = False,
@@ -153,7 +153,7 @@ class FakeConversations:
         self.close_delay = close_delay
         self.opened: list[FakeConversation] = []
 
-    async def __call__(self, *, profile: Profile, team: bool = False) -> Conversation:
+    async def __call__(self, *, profile: Profile, team: str | None = None) -> Conversation:
         conversation = FakeConversation(
             profile,
             team,
@@ -233,9 +233,11 @@ async def test_run_returns_the_mapped_record(client: httpx.AsyncClient) -> None:
 
 
 async def test_run_forwards_profile_and_team_to_the_runner(client: httpx.AsyncClient) -> None:
-    await client.post("/v1/runs", json={"prompt": "x", "profile": "eval", "team": True})
+    await client.post(
+        "/v1/runs", json={"prompt": "x", "profile": "eval", "team": "engineering"}
+    )
     call = client.runner.calls[-1]  # type: ignore[attr-defined]
-    assert call == {"prompt": "x", "profile": "eval", "team": True}
+    assert call == {"prompt": "x", "profile": "eval", "team": "engineering"}
 
 
 async def test_an_errored_agent_is_still_a_200(api_settings: Settings) -> None:
@@ -356,10 +358,12 @@ async def test_agents_lists_the_live_rosters(client: httpx.AsyncClient) -> None:
 
 async def test_agents_marks_team_only_workers(client: httpx.AsyncClient) -> None:
     # The distinction a client acts on: a "team" agent is absent unless the run is
-    # started with team=true, so listing them flat would be a lie half the time.
+    # started with team=<name>, so listing them flat would be a lie half the time.
     by_name = {a["name"]: a for a in (await client.get("/v1/agents")).json()["agents"]}
     assert {n: by_name[n]["availability"] for n in AGENTS} == dict.fromkeys(AGENTS, "always")
     assert {n: by_name[n]["availability"] for n in TEAM} == dict.fromkeys(TEAM, "team")
+    assert {n: by_name[n]["team"] for n in TEAM} == dict.fromkeys(TEAM, "engineering")
+    assert {n: by_name[n]["team"] for n in AGENTS} == dict.fromkeys(AGENTS, None)
 
 
 async def test_agents_maps_the_definition_fields(client: httpx.AsyncClient) -> None:
@@ -489,10 +493,10 @@ async def test_opening_a_session_returns_a_handle(client: httpx.AsyncClient) -> 
 
 
 async def test_session_options_are_pinned_at_open_time(client: httpx.AsyncClient) -> None:
-    body = await _open(client, profile="eval", team=True)
+    body = await _open(client, profile="eval", team="engineering")
     conversation = client.conversations.opened[-1]  # type: ignore[attr-defined]
-    assert (body["profile"], body["team"]) == ("eval", True)
-    assert (conversation.profile, conversation.team) == ("eval", True)
+    assert (body["profile"], body["team"]) == ("eval", "engineering")
+    assert (conversation.profile, conversation.team) == ("eval", "engineering")
 
 
 async def test_a_message_returns_the_mapped_turn(client: httpx.AsyncClient) -> None:
@@ -528,7 +532,7 @@ async def test_a_message_may_not_smuggle_run_options(client: httpx.AsyncClient) 
     # connected with, so accepting them here would tell the caller they had switched
     # profile mid-conversation when they had not.
     session = await _open(client)
-    for body in ({"prompt": "x", "profile": "eval"}, {"prompt": "x", "team": True}):
+    for body in ({"prompt": "x", "profile": "eval"}, {"prompt": "x", "team": "engineering"}):
         response = await client.post(f"/v1/sessions/{session['id']}/messages", json=body)
         assert response.status_code == 422
 
@@ -807,6 +811,23 @@ async def test_unknown_field_is_rejected_rather_than_ignored(client: httpx.Async
 async def test_unknown_profile_is_rejected(client: httpx.AsyncClient) -> None:
     response = await client.post("/v1/runs", json={"prompt": "x", "profile": "yolo"})
     assert response.status_code == 422
+
+
+async def test_unknown_team_is_rejected(client: httpx.AsyncClient) -> None:
+    response = await client.post("/v1/runs", json={"prompt": "x", "team": "yolo"})
+    assert response.status_code == 422
+
+
+async def test_unknown_team_is_rejected_on_session_open(client: httpx.AsyncClient) -> None:
+    response = await client.post("/v1/sessions", json={"team": "yolo"})
+    assert response.status_code == 422
+
+
+async def test_null_team_is_a_solo_run(client: httpx.AsyncClient) -> None:
+    response = await client.post("/v1/runs", json={"prompt": "x", "team": None})
+    assert response.status_code == 200
+    call = client.runner.calls[-1]  # type: ignore[attr-defined]
+    assert call["team"] is None
 
 
 async def test_unknown_route_is_also_a_problem_document(client: httpx.AsyncClient) -> None:

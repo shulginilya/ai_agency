@@ -63,7 +63,8 @@ commands to `tasks.py`, never to both.
 | `install` | Sync deps with dev + api extras (`uv sync`, or `pip install -e ".[dev,api]"`) |
 | `run "…"` | One-shot prompt |
 | `repl` | Interactive session, context retained across turns |
-| `team "…"` | Talk to the manager agent, which delegates to the workers |
+| `team "…"` | Talk to a manager agent, which delegates to its team's workers (`--team NAME`) |
+| `teams` | List available teams and their workers |
 | `serve` | Serve the HTTP API (`--port`, `--reload`) |
 | `doctor` | Print resolved config, workspace path, MCP status |
 | `lint` / `fmt` | ruff check / ruff format + autofix |
@@ -164,9 +165,11 @@ conversation. Turns also take a `RunSlots` slot, so sessions are not a way aroun
 
 `profile` and `team` are pinned when the session opens — sending either with a message is
 a 422 rather than a silent no-op, because they were baked into the options it connected
-with. A turn that times out or fails takes the session with it (the 504/502 body says
-so): a cancelled drain leaves the context half-written, and reusing it would produce a
-wrong answer rather than an error.
+with. `team` names an entry from `agents/team.py`'s `TEAMS` registry (e.g.
+`"engineering"`); omit it, or pass `null`, for a solo agent. An unknown name is a 422,
+not a silently-ignored option. A turn that times out or fails takes the session with it
+(the 504/502 body says so): a cancelled drain leaves the context half-written, and
+reusing it would produce a wrong answer rather than an error.
 
 ### Calling it from a browser
 

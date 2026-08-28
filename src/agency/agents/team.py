@@ -23,6 +23,8 @@ snake_case. Yes, in the same file. Yes, it is confusing.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from claude_agent_sdk import AgentDefinition
 
 # --- workers -----------------------------------------------------------------------
@@ -198,3 +200,46 @@ Lead with the answer or recommendation. Then the evidence. Then what you did not
 State uncertainty plainly -- a confident wrong answer is worse than an admitted gap.
 If a guardrail blocks a call, do not work around it: report what you needed and why.
 """
+
+
+# --- team registry -------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TeamDefinition:
+    """One named team: a manager prompt paired with the workers it may delegate to.
+
+    Adding a team is adding an entry to `TEAMS` below -- nothing else in the codebase
+    hard-codes a team name. `build_options(team=<name>)` looks a name up here, the CLI's
+    `agency teams` lists this registry, and `GET /v1/agents` reports each worker's `team`
+    field from the same source. Worker names must stay unique across `definitions.AGENTS`
+    and every team's `workers` -- `tests/test_team.py` pins that, because two rosters
+    disagreeing about who owns a name is invisible until `GET /v1/agents/{id}` picks
+    whichever one iterated first.
+    """
+
+    manager_prompt: str
+    workers: dict[str, AgentDefinition]
+
+
+TEAMS: dict[str, TeamDefinition] = {
+    "engineering": TeamDefinition(manager_prompt=MANAGER_PROMPT, workers=TEAM),
+}
+
+DEFAULT_TEAM = "engineering"
+"""What `build_options`/the CLI fall back to when the caller wants team mode but did not
+name one. A constant rather than repeated at each call site, so changing the default is
+a one-line edit here instead of a grep across cli.py, options.py and config.py."""
+
+
+def get_team(name: str) -> TeamDefinition:
+    """Look a team up by name, or raise with the full roster so the caller can self-correct.
+
+    A bare `KeyError` would surface as just `'foo'`, with no hint of what *was* valid.
+    Every caller of this -- the CLI, `options.build_options`, the API's request
+    validators -- wants the same actionable message, so it is built once, here.
+    """
+    try:
+        return TEAMS[name]
+    except KeyError:
+        known = ", ".join(sorted(TEAMS))
+        raise ValueError(f"unknown team {name!r}. known teams: {known}") from None
