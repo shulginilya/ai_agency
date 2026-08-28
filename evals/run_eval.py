@@ -49,7 +49,9 @@ async def run_case(case: dict[str, Any], attempt: int) -> dict[str, Any]:
         case["prompt"],
         profile=case.get("profile", "eval"),
         project_root=Path.cwd(),
-        team=bool(case.get("team", False)),
+        # A case's `team` is a name from agents.team.TEAMS (e.g. "engineering"),
+        # not a bool -- absent/null means a solo run, same as run_once's own default.
+        team=case.get("team"),
     )
     scores: list[Score] = score_record(record, case.get("assertions", []))
     passed = all(s.passed for s in scores)
