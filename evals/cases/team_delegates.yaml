@@ -6,7 +6,7 @@ prompt: >
   Review src/agency/hooks/guardrails.py for ways a tool call could get past it.
   Report the findings.
 profile: eval
-team: true
+team: engineering
 assertions:
   - type: succeeded
   - type: tool_called
