@@ -6,6 +6,8 @@ A production-shaped starting point for agentic development with the
 It gives you the four things a toy script doesn't: **custom tools**, **guardrails**,
 **observability**, and **evals**.
 
+Diagrams of how it fits together: [`docs/architecture.md`](docs/architecture.md).
+
 ## Quick start
 
 Windows (PowerShell):

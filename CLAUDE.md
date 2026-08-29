@@ -4,6 +4,9 @@ Harness for building agents on the Claude Agent SDK (Python).
 
 ## Architecture
 
+Diagrams: `docs/architecture.md` (Mermaid; run flow, manager/worker team, module
+map, credentials). Update it in the same commit as any wiring change.
+
 `src/agency/options.py` is the single chokepoint: every runtime path (CLI, tests, evals)
 builds its `ClaudeAgentOptions` from `build_options(profile)`. Do not construct
 `ClaudeAgentOptions` anywhere else — config drift between run modes is the main way
