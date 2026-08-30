@@ -123,13 +123,15 @@ flowchart TB
 
     USER(["you"]) <--> MGR["<b>manager</b> — main thread<br/>system_prompt = MANAGER_PROMPT<br/>agents/team.py"]
 
-    MGR -- "Agent tool call<br/>brief string only" --> W1
+    MGR -- "Agent tool call<br/>brief string only" --> W0
+    MGR --> W1
     MGR --> W2
     MGR --> W3
     MGR -. "always available<br/>agents/definitions.py" .-> W4
     MGR -.-> W5
 
     subgraph team["TEAMS['engineering'].workers"]
+        W0["<b>scrum-master</b><br/>Read, Grep, Glob<br/>sonnet, maxTurns 15"]
         W1["<b>reviewer</b><br/>Read, Grep, Glob<br/>sonnet, maxTurns 15"]
         W2["<b>test-writer</b><br/>+ Write, Edit, Bash<br/>scoped to tests/"]
         W3["<b>developer</b><br/>+ Edit, Write, Bash<br/>claude-opus-5, maxTurns 30"]
@@ -140,11 +142,13 @@ flowchart TB
         W5["<b>critic</b><br/>Read, Grep, Glob"]
     end
 
+    W0 -- "work breakdown,<br/>not a delegation" --> MGR
     W1 -- "final message only" --> MGR
     W2 --> MGR
     W3 --> MGR
 
     HOOKS["hooks/delegation.py<br/>SubagentStart, SubagentStop,<br/>PostToolUseFailure"]
+    W0 -.-> HOOKS
     W1 -.-> HOOKS
     W2 -.-> HOOKS
     W3 -.-> HOOKS
@@ -152,7 +156,7 @@ flowchart TB
     HOOKS --> RR["RunRecord tool trace<br/>per run, dies with it"]
     REG --> APIA["GET /v1/agents"]
 
-    class W1,W2,W3 worker
+    class W0,W1,W2,W3 worker
     class W4,W5 ro
 ```
 
@@ -180,6 +184,11 @@ history, no tool results, and not the manager's system prompt. Three consequence
 
 The tree is capped in `options.SUBAGENT_LIMITS`: spawn depth 1 (workers cannot spawn
 workers), concurrency 4. Enforced by the CLI, not by prompt wording.
+
+`scrum-master` is the reason that cap is worth restating. It plans the delegation but
+has no `Agent` tool, so the plan comes back as a message the manager acts on — the
+manager stays the only node that delegates. Giving a planner the `Agent` tool would
+not create a second tier anyway; spawn depth 1 would just fail the call.
 
 ### Where a team gets selected
 
