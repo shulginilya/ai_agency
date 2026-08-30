@@ -24,6 +24,17 @@ from agency.options import build_options
 
 ROSTER = sorted({*AGENTS, *TEAMS["engineering"].workers})
 
+_WRITE_ISH = frozenset({"Write", "Edit", "NotebookEdit", "Bash"})
+
+READ_ONLY_AGENTS = sorted(
+    name
+    for name, definition in {**AGENTS, **TEAMS["engineering"].workers}.items()
+    if not _WRITE_ISH.intersection(definition.tools or [])
+)
+"""Derived, never hand-listed. A hand-listed roster here is a fourth copy of the team
+that drifts silently the moment someone adds a worker -- which is exactly how
+`scrum-master` reached this branch with no ceiling."""
+
 
 def _resolve(grants: Grants, roster: list[str] | None = None):
     return resolve(grants, CAPABILITIES, roster if roster is not None else ROSTER)
@@ -137,12 +148,37 @@ def test_no_seed_capability_can_be_granted_to_a_read_only_agent() -> None:
     A new pack containing a write or exec tool fails here the day it is added to the
     registry, rather than the day someone points it at the reviewer.
     """
-    for agent in ("reviewer", "critic", "researcher"):
+    for agent in READ_ONLY_AGENTS:
         ceiling = ceiling_for(agent)
         for name, capability in CAPABILITIES.items():
             if set(capability.tools) & ceiling.never_tools:
                 with pytest.raises(GrantError):
                     _resolve(Grants(agents={agent: (name,)}), [agent])
+
+
+def test_every_read_only_agent_has_a_ceiling() -> None:
+    """The guard that would have caught `scrum-master` shipping without one.
+
+    Read-only is a property of *absence* -- no write tool in the definition's list --
+    and a grant is precisely the mechanism that fills an absence back in.
+    `tests/test_team.py` asserts on the definition, so it cannot see a grant; this is
+    the only place the property is defended once capabilities exist. A new read-only
+    worker added without a ceiling fails here the day it lands, rather than the day
+    someone points `shell` at it.
+    """
+    for agent in READ_ONLY_AGENTS:
+        missing = _WRITE_ISH - ceiling_for(agent).never_tools
+        assert not missing, (
+            f"{agent} is read-only by definition but {sorted(missing)} can still be granted"
+        )
+
+
+def test_the_planner_cannot_be_granted_the_delegation_tool() -> None:
+    # No seeded pack carries Agent/Task, so the capability loop above cannot reach this
+    # bar. Asserted directly instead: spawn depth is capped at 1, so a second delegating
+    # node cannot work even if granted -- it would fail at runtime rather than be
+    # refused here, which is the worse of the two failures.
+    assert {"Agent", "Task"} <= ceiling_for("scrum-master").never_tools
 
 
 def test_never_grantable_tools_are_rejected_at_validation() -> None:

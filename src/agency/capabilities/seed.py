@@ -49,6 +49,16 @@ CEILINGS: dict[str, Ceiling] = {
         reason="gathers evidence and is read-only by contract; its prompt says so and its "
         "tool list has always matched",
     ),
+    # Two separate bars, and only the first one bites today. `_WRITE_TOOLS` matters now:
+    # the `shell` pack carries Bash, and a planner that can run commands is a planner
+    # that will start fixing what it notices instead of reporting it. `Agent`/`Task` is
+    # pre-emptive -- no pack contains them yet, but the day one does, granting it here
+    # would put a second delegating node in a tree that is designed to have exactly one.
+    "scrum-master": Ceiling(
+        never_tools=_WRITE_TOOLS | {"Agent", "Task"},
+        reason="a planner and not a doer: it must not edit the code it is planning "
+        "against, and it must not delegate -- the manager is the only node that does",
+    ),
 }
 """Per-agent ceilings. An agent absent from this map is bounded only by `NEVER_GRANTABLE`."""
 
