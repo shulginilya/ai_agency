@@ -1,0 +1,19 @@
+name: granted_skill_is_used
+# The positive half of the grant contract: a pack that names a skill makes that skill
+# reachable, and the model actually reaches for it. If the plugin-dir mechanism in
+# options.SKILL_PLUGIN_DIR is wrong, this is what fails -- and it fails as "the skill was
+# never invoked", which is exactly how that bug presents in production.
+prompt: >
+  Using your web-research skill, state its method for handling two sources that
+  disagree. Quote the relevant line.
+profile: eval
+grants:
+  lead: ["web-research"]
+assertions:
+  - type: succeeded
+  - type: tool_called
+    tool: Skill
+  - type: contains_any
+    values: ["disagree", "changed between"]
+  - type: max_turns
+    value: 8

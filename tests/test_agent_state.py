@@ -23,6 +23,11 @@ from agency.hooks.delegation import (
 from agency.obs.agent_state import REGISTRY, AgentState, AgentStateRegistry
 
 
+def _response() -> AgentsResponse:
+    """The roster as the route builds it: one snapshot, taken by the caller."""
+    return AgentsResponse.from_rosters(REGISTRY.snapshot(), REGISTRY.default_state())
+
+
 @pytest.fixture(autouse=True)
 def clean_registry() -> Any:
     REGISTRY.reset()
@@ -208,7 +213,7 @@ def test_the_response_reports_live_status_per_agent() -> None:
     REGISTRY.record_start("reviewer")
     REGISTRY.record_failure("critic")
 
-    by_name = {a.name: a for a in AgentsResponse.from_rosters().agents}
+    by_name = {a.name: a for a in _response().agents}
     assert by_name["reviewer"].status is AgentStatus.RUNNING
     assert by_name["critic"].status is AgentStatus.ERROR
     assert by_name["test-writer"].status is AgentStatus.IDLE
@@ -218,7 +223,7 @@ def test_the_response_reports_live_status_per_agent() -> None:
 
 
 def test_id_equals_name_and_is_never_blank() -> None:
-    for agent in AgentsResponse.from_rosters().agents:
+    for agent in _response().agents:
         assert agent.id == agent.name
         assert agent.id
 
@@ -226,7 +231,7 @@ def test_id_equals_name_and_is_never_blank() -> None:
 def test_status_serialises_as_the_bare_string() -> None:
     # The frontend switches on these values; `(str, Enum)` must not leak
     # "AgentStatus.IDLE" into the JSON the way a plain Enum would.
-    body = AgentsResponse.from_rosters().model_dump(mode="json")
+    body = _response().model_dump(mode="json")
     assert {a["status"] for a in body["agents"]} == {"idle"}
 
 

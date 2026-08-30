@@ -20,10 +20,12 @@ from typing import Any
 
 import yaml
 
+from agency.capabilities.model import Grants
+from agency.capabilities.store import make_capability_store
 from agency.config import get_settings
 from agency.hooks.delegation import delegations
 from agency.obs.logging import configure_logging, get_logger
-from agency.runner import run_once
+from agency.runner import resolve_grants, run_once
 from evals.scorers import Score, score_record
 
 log = get_logger(__name__)
@@ -45,10 +47,21 @@ def load_cases(name: str | None = None) -> list[dict[str, Any]]:
 
 
 async def run_case(case: dict[str, Any], attempt: int) -> dict[str, Any]:
+    # A case's `grants` mirrors the API body: {"lead": [...], "team": [...],
+    # "agents": {...}}. Resolved through the same path a real run uses -- against the
+    # database when one is configured, the seed registry otherwise -- so an eval cannot
+    # pass with a capability set no real caller could obtain.
+    grants = await resolve_grants(
+        make_capability_store(get_settings()),
+        Grants.parse(case.get("grants")),
+        team=case.get("team"),
+        project_root=Path.cwd(),
+    )
     record = await run_once(
         case["prompt"],
         profile=case.get("profile", "eval"),
         project_root=Path.cwd(),
+        grants=grants,
         # A case's `team` is a name from agents.team.TEAMS (e.g. "engineering"),
         # not a bool -- absent/null means a solo run, same as run_once's own default.
         team=case.get("team"),

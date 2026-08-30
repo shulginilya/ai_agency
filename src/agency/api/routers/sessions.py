@@ -27,7 +27,13 @@ from typing import Annotated
 import anyio
 from fastapi import APIRouter, Depends, Path, Response, status
 
-from agency.api.deps import SessionsDep, SettingsDep, SlotsDep, require_api_key
+from agency.api.deps import (
+    CapabilitiesDep,
+    SessionsDep,
+    SettingsDep,
+    SlotsDep,
+    require_api_key,
+)
 from agency.api.errors import (
     APIError,
     RunTimeout,
@@ -43,6 +49,7 @@ from agency.api.schemas import (
     SessionInfo,
     SessionsResponse,
 )
+from agency.capabilities.model import Grants
 from agency.obs.logging import get_logger
 
 log = get_logger(__name__)
@@ -80,6 +87,7 @@ async def open_session(
     body: SessionCreateRequest,
     sessions: SessionsDep,
     settings: SettingsDep,
+    capabilities: CapabilitiesDep,
 ) -> SessionInfo:
     """Connect a session and hold it open.
 
@@ -92,7 +100,14 @@ async def open_session(
     was configured with at the time".
     """
     profile = body.profile or settings.profile
-    session = await sessions.open(profile=profile, team=body.team)
+    # Resolved once, at open time, and held on the session. Grants are baked into the
+    # ClaudeAgentOptions this session connects with, so -- like profile and team -- there
+    # is no honest way to change them mid-conversation; MessageRequest stays prompt-only.
+    from agency.runner import resolve_grants
+
+    requested = body.grants.to_grants() if body.grants else Grants()
+    grants = await resolve_grants(capabilities, requested, team=body.team)
+    session = await sessions.open(profile=profile, team=body.team, grants=grants)
     return SessionInfo.from_session(session)
 
 
@@ -212,7 +227,7 @@ async def send_message(
         run_id=record.run_id,
         is_error=record.is_error,
     )
-    return MessageResponse.from_record(session, record)
+    return MessageResponse.from_record(session, record, session.grants)
 
 
 @router.delete(

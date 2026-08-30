@@ -25,6 +25,9 @@ RESEARCHER = AgentDefinition(
         "- You are read-only. Never write or edit files."
     ),
     tools=["Read", "Glob", "Grep", "WebSearch", "WebFetch"],
+    # See the note on REVIEWER in team.py: read-only stated as a denial rather than as an
+    # absence, so a capability grant cannot quietly erase it.
+    disallowedTools=["Write", "Edit", "NotebookEdit", "Bash"],
     model="sonnet",
     maxTurns=15,
 )
@@ -43,6 +46,7 @@ CRITIC = AgentDefinition(
         "- Do not rewrite the work. Report only."
     ),
     tools=["Read", "Glob", "Grep"],
+    disallowedTools=["Write", "Edit", "NotebookEdit", "Bash"],
     model="sonnet",
     maxTurns=10,
 )

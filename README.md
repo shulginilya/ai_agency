@@ -6,6 +6,11 @@ A production-shaped starting point for agentic development with the
 It gives you the four things a toy script doesn't: **custom tools**, **guardrails**,
 **observability**, and **evals**.
 
+It also does **capability grants**: named, reviewed bundles of tools and skills that a
+caller attaches per run to the main thread, a whole team, or one worker -- without
+widening the permission profile. Optionally backed by a database, so packs can change
+without a deploy. See the Capabilities section of `CLAUDE.md`.
+
 Diagrams of how it fits together: [`docs/architecture.md`](docs/architecture.md).
 
 ## Quick start

@@ -27,6 +27,8 @@ from dataclasses import dataclass
 
 from claude_agent_sdk import AgentDefinition
 
+from agency.agents.definitions import AGENTS
+
 # --- workers -----------------------------------------------------------------------
 
 REVIEWER = AgentDefinition(
@@ -56,6 +58,19 @@ REVIEWER = AgentDefinition(
         "You are read-only. You have no Write, Edit or Bash tools and must not ask for them."
     ),
     tools=["Read", "Grep", "Glob"],
+    # Read-only stated as a *denial*, not merely as an absence.
+    #
+    # This list used to be unnecessary: `tools` omitted Write/Edit/Bash, so the reviewer
+    # could not edit. But a capability grant is precisely the mechanism that erases an
+    # absence -- one `--grant-agent reviewer:shell` and the read-only worker quietly
+    # becomes a second developer, with no failing test to notice, because the property
+    # was never asserted anywhere except by omission.
+    #
+    # `disallowedTools` removes a tool from the worker's context entirely and outranks
+    # anything that would allow it, so this holds even against a bug in the resolver.
+    # `capabilities.seed.CEILINGS` refuses the grant one layer earlier and with a legible
+    # message; this is the layer that does not depend on our code being right.
+    disallowedTools=["Write", "Edit", "NotebookEdit", "Bash"],
     model="sonnet",
     maxTurns=15,
 )
@@ -229,6 +244,20 @@ DEFAULT_TEAM = "engineering"
 """What `build_options`/the CLI fall back to when the caller wants team mode but did not
 name one. A constant rather than repeated at each call site, so changing the default is
 a one-line edit here instead of a grep across cli.py, options.py and config.py."""
+
+
+def roster_names(team: str | None) -> list[str]:
+    """Every agent name invocable on a run, sorted.
+
+    Resolution needs this to expand a team-scoped grant and to reject an agent-scoped one
+    that names nobody. It lives here rather than in `capabilities/` so that package stays
+    free of the SDK -- `api/schemas.py` imports the capability model at module scope and
+    must remain importable without it.
+    """
+    names = set(AGENTS)
+    if team:
+        names |= set(get_team(team).workers)
+    return sorted(names)
 
 
 def get_team(name: str) -> TeamDefinition:

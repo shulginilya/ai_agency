@@ -19,6 +19,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from agency.api.middleware import REQUEST_ID_HEADER
+from agency.capabilities.model import GrantError
 from agency.obs.cost import RunRecord
 from agency.obs.logging import get_logger
 
@@ -257,6 +258,31 @@ def install_error_handlers(app: FastAPI) -> None:
             type_uri=exc.type_uri,
             headers=headers,
             **exc.extra,
+        )
+
+    @app.exception_handler(GrantError)
+    async def _grant_error(request: Request, exc: Exception) -> JSONResponse:
+        """Every capability rejection, as one problem type.
+
+        `GrantError` covers an unknown pack, an unknown agent, a ceiling violation and a
+        malformed `agent:pack` pair. They are one class deliberately: the caller sees one
+        vocabulary whether the rejection came from a field validator (where pydantic
+        wraps it) or from the resolver mid-route (where it arrives here), and the CLI
+        catches one thing.
+
+        422 rather than 400: the request is syntactically fine and semantically
+        impossible, which is what 422 is for -- and it matches what the field validators
+        already produce for the same class of mistake.
+        """
+        assert isinstance(exc, GrantError)
+        log.info("api.error", status=422, slug=ValidationFailed.slug,
+                 path=request.url.path, detail=str(exc))
+        return problem(
+            request,
+            status=422,
+            title="Capability Grant Refused",
+            detail=str(exc),
+            type_uri=f"{PROBLEM_BASE}/grant-refused",
         )
 
     @app.exception_handler(RequestValidationError)

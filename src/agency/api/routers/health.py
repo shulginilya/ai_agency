@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from agency.api.deps import SessionsDep, SettingsDep, SlotsDep
+from agency.api.deps import CapabilitiesDep, SessionsDep, SettingsDep, SlotsDep
 from agency.api.schemas import Health, Readiness
 from agency.api.version import VERSION
 
@@ -28,7 +28,12 @@ async def healthz() -> Health:
 
 
 @router.get("/readyz", response_model=Readiness, summary="Readiness probe")
-async def readyz(settings: SettingsDep, slots: SlotsDep, sessions: SessionsDep) -> Readiness:
+async def readyz(
+    settings: SettingsDep,
+    slots: SlotsDep,
+    sessions: SessionsDep,
+    capabilities: CapabilitiesDep,
+) -> Readiness:
     checks: dict[str, str] = {}
 
     for name, path in (
@@ -49,7 +54,22 @@ async def readyz(settings: SettingsDep, slots: SlotsDep, sessions: SessionsDep) 
     # pulling it out of rotation while it works would be exactly wrong.
     checks["capacity"] = "ok" if slots.limit > 0 else "no slots configured"
 
-    status = "ready" if all(v == "ok" for v in checks.values()) else "degraded"
+    # Readiness, never liveness. This module's own docstring makes the argument, and the
+    # database is exactly the dependency it was written for: a blip should take this
+    # instance out of rotation, not restart the container.
+    #
+    # The probe is a registry read rather than a bare `SELECT 1`, because that is what a
+    # run actually needs -- a reachable server whose capability tables answer. With no
+    # database configured this reads the in-code seed and always succeeds, which is
+    # correct: nothing is missing.
+    backend = settings.database_backend()
+    try:
+        count = len(await capabilities.registry())
+        checks["database"] = "ok" if backend == "none" else f"ok ({backend}, {count} packs)"
+    except Exception as exc:  # noqa: BLE001 - the point is to report, not to raise
+        checks["database"] = f"unreachable: {exc}"
+
+    status = "ready" if all(v.startswith("ok") for v in checks.values()) else "degraded"
     return Readiness(
         status=status,  # type: ignore[arg-type]
         checks=checks,

@@ -388,3 +388,70 @@ A diagram nobody updates is worse than no diagram. Three cheap habits:
   and the caption should point at it instead.
 - The forbidden edges in §3 and the traps in §2 and §4 are the load-bearing parts. If
   one stops being true, delete it — a stale warning costs more than a missing one.
+
+
+## Capability grants: resolve, then build
+
+The load-bearing shape. Resolution may hit a database and is async; `build_options` is
+synchronous, total and free of I/O. `ResolvedGrants` is the value that crosses between
+them, which is why a `build_options` test needs no database and a store test builds no
+options.
+
+```mermaid
+flowchart TD
+    subgraph edge["Entry points"]
+        CLI["agency team --grant ..."]
+        API["POST /v1/runs {grants}"]
+    end
+
+    CLI --> P["Grants.parse / _parse_grants<br/><i>names only, never tool lists</i>"]
+    API --> P
+
+    P --> RG["runner.resolve_grants<br/><b>async</b>"]
+    RG --> ST{"AGENCY_DATABASE_URL?"}
+    ST -->|set| DB[("capability<br/>capability_revision<br/>grant_assignment")]
+    ST -->|unset| SEED["capabilities/seed.py<br/><i>in-code registry</i>"]
+    DB --> CACHE["CachedCapabilityStore<br/><i>TTL; assignments never cached</i>"]
+    CACHE --> R
+    SEED --> R
+
+    R["capabilities.resolve<br/><b>pure, no I/O</b>"]
+    R --> CEIL{"ceiling check<br/><i>code, never the DB</i>"}
+    CEIL -->|"agent scope"| ERR["GrantError → 422"]
+    CEIL -->|"team scope"| SKIP["skipped[] → response + CLI"]
+    CEIL --> RESOLVED["<b>ResolvedGrants</b><br/>lead / per-agent bundles<br/>+ pinned revision ids"]
+
+    RESOLVED --> BO["options.build_options<br/><b>sync, no I/O</b>"]
+    BO --> AT["allowed_tools<br/><i>dev+eval only</i>"]
+    BO --> POL["make_can_use_tool(granted)<br/><i>sandboxed path</i>"]
+    BO --> AG["apply_to_roster<br/><i>copy, never mutate</i>"]
+    BO --> SK["skills[] + plugins[]<br/><i>only if a skill was granted</i>"]
+    RESOLVED --> RS["RunStore.start<br/><i>run_grant rows, before the first model call</i>"]
+```
+
+### Persistence layers
+
+Three seams, each a Protocol with a no-database default and a `make_*` binder. Nothing
+above them branches on whether a database exists.
+
+```mermaid
+flowchart LR
+    subgraph seams["Protocols"]
+        CS["CapabilityStore"]
+        RSt["RunStore"]
+        AS["AgentStateStore"]
+    end
+
+    CS -->|unset| SeedS["SeedCapabilityStore"]
+    CS -->|set| DbC["DbCapabilityStore"]
+    RSt -->|unset| FileS["FileRunStore<br/><i>runs/*.json</i>"]
+    RSt -->|set| DbR["DbRunStore"]
+    AS -->|unset| MemS["MemoryAgentStateStore<br/><i>process-global</i>"]
+    AS -->|set| DbA["DbAgentStateStore<br/><i>shared across workers</i>"]
+
+    DbA --- SWEEP["server_instance + heartbeat<br/><i>sweeps a dead process's open rows,<br/>never a live sibling's</i>"]
+```
+
+The `AgentStateStore` split is what fixes `GET /v1/agents` under `uvicorn --workers N`:
+the in-memory registry gives each worker its own view, so a caller load-balanced onto
+worker 2 sees `idle` for an agent running in worker 1.

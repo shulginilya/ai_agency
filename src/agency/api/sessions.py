@@ -51,6 +51,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from agency.api.errors import APIError, NotFound, Overloaded, SessionBusy
+from agency.capabilities.model import EMPTY as NO_GRANTS
+from agency.capabilities.model import ResolvedGrants
 from agency.config import Profile
 from agency.obs.cost import RunRecord
 from agency.obs.logging import get_logger
@@ -83,7 +85,13 @@ class Conversation(Protocol):
 class ConversationFactory(Protocol):
     """Opens a `Conversation`. `deps.make_conversation_factory` is the production one."""
 
-    async def __call__(self, *, profile: Profile, team: str | None = None) -> Conversation: ...
+    async def __call__(
+        self,
+        *,
+        profile: Profile,
+        team: str | None = None,
+        grants: ResolvedGrants | None = None,
+    ) -> Conversation: ...
 
 
 @dataclass
@@ -101,6 +109,7 @@ class Session:
     team: str | None
     conversation: Conversation
     idle_ttl_s: float
+    grants: ResolvedGrants = NO_GRANTS
     created_at: datetime = field(default_factory=_now)
     last_active_at: datetime = field(default_factory=_now)
     turns: int = 0
@@ -160,7 +169,13 @@ class SessionStore:
     def available(self) -> int:
         return max(0, self.limit - self.count - self._opening)
 
-    async def open(self, *, profile: Profile, team: str | None = None) -> Session:
+    async def open(
+        self,
+        *,
+        profile: Profile,
+        team: str | None = None,
+        grants: ResolvedGrants | None = None,
+    ) -> Session:
         """Connect a new session, or refuse with 503 if the box is full."""
         await self.reap()
         if self.count + self._opening >= self.limit:
@@ -171,7 +186,7 @@ class SessionStore:
 
         self._opening += 1
         try:
-            conversation = await self._factory(profile=profile, team=team)
+            conversation = await self._factory(profile=profile, team=team, grants=grants)
         finally:
             self._opening -= 1
 
@@ -184,6 +199,10 @@ class SessionStore:
             team=team,
             conversation=conversation,
             idle_ttl_s=self.idle_ttl_s,
+            # Fixed at open time, like profile and team, and for the same reason: they
+            # were baked into the ClaudeAgentOptions this session connected with, so
+            # there is no honest way to honour a change mid-conversation.
+            grants=grants or NO_GRANTS,
         )
         self._sessions[session.id] = session
         log.info("api.session.open", session_id=session.id, profile=profile, team=team)
