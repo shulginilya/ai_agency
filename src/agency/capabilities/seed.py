@@ -80,6 +80,23 @@ CAPABILITIES: dict[str, Capability] = {
             "would settle."
         ),
     ),
+    "change-to-issue": Capability(
+        name="change-to-issue",
+        description=(
+            "Write up a change that already exists as a reviewable ticket body -- "
+            "problem, proposal, the decisions worth arguing with, and what is not "
+            "verified. Grant when the deliverable is a write-up for other people (an "
+            "issue, a PR description) rather than the change itself. Carries no tools: "
+            "it shapes what the agent can already read, so every agent may hold it."
+        ),
+        skills=("agency-caps:change-to-issue",),
+        prompt_note=(
+            "You can invoke the `change-to-issue` skill to turn a change that already "
+            "exists into a ticket body someone else can review. Use it when asked for a "
+            "ticket, an issue, or a write-up of a finished change -- not to plan work "
+            "that has not happened. It produces a draft; it never files anything."
+        ),
+    ),
     "shell": Capability(
         name="shell",
         description=(

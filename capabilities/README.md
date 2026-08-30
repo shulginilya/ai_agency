@@ -22,8 +22,20 @@ silent:
 is independent of cwd and of every settings file. That is the only route that leaves the
 isolation invariant intact.
 
-**Status: unverified against a live CLI.** See the Phase 0 spike in
+**Status: discovery verified 2026-08-30**, by running the bundled CLI directly:
+
+```
+claude --plugin-dir <abs path to capabilities/> plugin details agency-caps
+```
+
+It reports the plugin and both skills in its component inventory, from a working
+directory that is not the repo and with no settings file naming them -- which is exactly
+the claim above. Not yet verified: a model actually invoking a granted skill mid-run.
+That needs a working credential; see the Phase 0 spike in
 `docs/plan_dynamic_capabilities_db.md`.
+
+That command is also the fastest way to check a skill you just added is visible at all,
+and it prints the token cost of adding it to every session.
 
 ## Do not put secrets in here
 
@@ -38,3 +50,13 @@ disk and are readable by any agent holding `Read` or `Bash`.
 3. Names may not contain parentheses, commas, or surrounding whitespace; the CLI's
    allow-rule tokeniser cannot carry them. `capabilities.resolve.validate_capability`
    enforces the same rules so a typo fails at resolve time, not at `connect()`.
+
+Validation only covers what the tokeniser can carry, never whether the directory is
+there: a pack naming a skill that does not exist on disk resolves cleanly, grants
+nothing, and fails as "the model never invoked it" --- indistinguishable from the model
+choosing not to. `test_every_seeded_skill_exists_in_the_plugin_directory` is the guard.
+
+A skill granted to a *worker* rather than the lead reaches the CLI through the same two
+session-wide switches (`--plugin-dir` and the `Skill(name)` allow rule), because neither
+can be scoped to one agent. `ResolvedGrants.granted_skills` unions across scopes for
+that reason; the per-agent restriction is `AgentDefinition.skills`.

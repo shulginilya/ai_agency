@@ -93,9 +93,14 @@ settings file, which is the only reason skills can work here at all:
   `.claude/skills/` at the repo root would still be invisible, and `add_dirs` does not
   help -- that widens file access, not settings discovery.
 
-UNVERIFIED against a live CLI as of this commit; see the spike note in
-`docs/plan_dynamic_capabilities_db.md`. Passed only when a grant actually names a skill,
-so an ungranted run's baseline -- including the eval baseline -- is untouched.
+Discovery verified against the bundled CLI on 2026-08-30:
+`claude --plugin-dir <abs path> plugin details agency-caps` lists both skills from a cwd
+that is not the repo, with no settings file naming them. What remains unverified is a
+model *invoking* a granted skill mid-run -- see `evals/cases/granted_skill_is_used.yaml`,
+which needs a working credential.
+
+Passed only when a grant actually names a skill, so an ungranted run's baseline --
+including the eval baseline -- is untouched.
 """
 
 
@@ -230,7 +235,13 @@ def build_options(
     # an unconditional plugin dir would move every run's baseline, the eval baseline
     # included, for no benefit. Absolute path from the project root: a relative one
     # resolves against `cwd`, which is the workspace scratch directory.
-    granted_skills = list(grants.lead.skills)
+    #
+    # The union across scopes, not `grants.lead.skills`: both switches below are
+    # session-wide and neither can be scoped to a worker, so reading the lead alone
+    # made an agent-scoped skill grant a silent no-op -- `AgentDefinition.skills`
+    # naming a skill the CLI was never told to discover. See
+    # `ResolvedGrants.granted_skills`.
+    granted_skills = list(grants.granted_skills())
     plugins: list[dict[str, str]] = []
     if granted_skills:
         plugin_path = (project_root / SKILL_PLUGIN_DIR).resolve()

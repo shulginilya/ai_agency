@@ -84,8 +84,14 @@ def test_no_grants_resolves_to_the_shared_empty_value() -> None:
 
 
 def test_unknown_capability_names_the_known_ones() -> None:
-    with pytest.raises(GrantError, match="known capabilities: shell, web-research"):
+    # Derived from the registry, not hand-listed: the point of the assertion is that the
+    # message tells the caller what they *could* have asked for, and a literal list here
+    # fails the day a pack is added -- which says nothing about the behaviour under test.
+    with pytest.raises(GrantError) as excinfo:
         _resolve(Grants(lead=("web-reserch",)))
+    message = str(excinfo.value)
+    assert "web-reserch" in message
+    assert f"known capabilities: {', '.join(sorted(CAPABILITIES))}" in message
 
 
 def test_unknown_agent_is_an_error_not_a_silent_no_op() -> None:
@@ -393,3 +399,68 @@ def test_the_reviewer_is_read_only_by_denial_not_by_absence() -> None:
 def test_granted_tools_is_the_union_across_scopes(settings: Settings, tmp_path: Path) -> None:
     resolved = _resolve(Grants(lead=("web-research",), agents={"developer": ("shell",)}))
     assert resolved.granted_tools() == frozenset({"WebSearch", "WebFetch", "Bash"})
+
+
+def test_granted_skills_is_the_union_across_scopes() -> None:
+    """The bug this union exists to prevent: a worker-scoped skill grant that does nothing.
+
+    Both switches that make a skill real -- the plugin dir that makes it discoverable and
+    the `Skill(name)` allow rule the SDK derives from `ClaudeAgentOptions.skills` -- are
+    session-wide. Reading only `lead.skills` left `AgentDefinition.skills` naming a skill
+    the CLI was never told to discover: no error, no warning, just a worker that could
+    not see it.
+    """
+    resolved = _resolve(Grants(agents={"scrum-master": ("change-to-issue",)}))
+    assert resolved.lead.skills == ()
+    assert resolved.granted_skills() == ("agency-caps:change-to-issue",)
+
+
+def test_a_worker_scoped_skill_grant_reaches_the_session_switches(
+    settings: Settings, tmp_path: Path
+) -> None:
+    options = build_options(
+        profile="dev",
+        settings=settings,
+        project_root=tmp_path,
+        team="engineering",
+        grants=_resolve(Grants(agents={"scrum-master": ("change-to-issue",)})),
+    )
+    assert options.skills == ["agency-caps:change-to-issue"]
+    assert options.plugins == [
+        {"type": "local", "path": str((tmp_path / "capabilities").resolve())}
+    ]
+    # And the worker itself holds it -- per-agent scoping lives here, on the definition
+    # the CLI applies to the worker's own session, not on the session-wide switches.
+    planner = (options.agents or {})["scrum-master"]
+    assert planner.skills == ["agency-caps:change-to-issue"]
+    assert (options.agents or {})["reviewer"].skills is None
+
+
+def test_the_planner_may_hold_the_write_up_pack() -> None:
+    """`change-to-issue` carries no tools, so no ceiling can bar it.
+
+    That is the reason it is grantable to a read-only agent at all: it shapes what the
+    agent can already read. A pack that needed Bash to run `gh` would be refused here.
+    """
+    assert CAPABILITIES["change-to-issue"].tools == ()
+    resolved = _resolve(Grants(agents={"scrum-master": ("change-to-issue",)}))
+    assert resolved.skipped == ()
+    assert resolved.for_agent("scrum-master").skills == ("agency-caps:change-to-issue",)
+
+
+def test_every_seeded_skill_exists_in_the_plugin_directory() -> None:
+    """A pack naming a skill that is not on disk resolves cleanly and grants nothing.
+
+    Name validation covers what the CLI's tokeniser can carry, not whether the skill is
+    there -- so a rename or a typo in the directory name fails as "the model never
+    invoked it", which is indistinguishable from the model choosing not to.
+    """
+    plugin_root = Path(__file__).resolve().parents[1] / "capabilities"
+    for capability in CAPABILITIES.values():
+        for skill in capability.skills:
+            plugin, _, name = skill.partition(":")
+            assert plugin == "agency-caps", f"{skill} is not qualified with this plugin"
+            assert (plugin_root / "skills" / name / "SKILL.md").is_file(), (
+                f"capability {capability.name!r} names {skill!r}, "
+                f"but capabilities/skills/{name}/SKILL.md does not exist"
+            )

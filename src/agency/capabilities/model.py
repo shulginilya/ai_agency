@@ -288,6 +288,29 @@ class ResolvedGrants:
             tools.update(bundle.tools)
         return frozenset(tools)
 
+    def granted_skills(self) -> tuple[str, ...]:
+        """Every skill granted anywhere in this run, in first-mention order.
+
+        The union across scopes, for the same reason `granted_tools` is one, but the
+        mechanism is different and worth stating. A skill reaches the model through two
+        session-wide switches: the plugin directory that makes it *discoverable*, and the
+        `Skill(name)` allow rule the SDK derives from `ClaudeAgentOptions.skills`. Both
+        are set once for the whole session -- neither can be scoped to a worker. Reading
+        only `lead.skills` therefore made an agent-scoped skill grant a silent no-op:
+        `AgentDefinition.skills` named a skill the CLI was never told to discover, no
+        error, no warning, just a worker that cannot see it.
+
+        Per-agent restriction lives where it works, exactly as it does for tools: on
+        `AgentDefinition.skills`, which the CLI applies to the worker's own session. The
+        widening here is that the *lead* can also see a skill granted only to a worker.
+        That is the same trade `granted_tools` already makes, and the alternative -- a
+        grant that resolves, logs and applies while doing nothing -- is worse.
+        """
+        skills: list[str] = list(self.lead.skills)
+        for bundle in self.agents.values():
+            _extend_unique(skills, bundle.skills)
+        return tuple(skills)
+
     def summary(self) -> dict[str, list[str]]:
         """Compact form for the `options.built` log line."""
         out: dict[str, list[str]] = {}
