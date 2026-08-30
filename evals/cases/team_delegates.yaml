@@ -11,8 +11,12 @@ assertions:
   - type: succeeded
   - type: tool_called
     tool: Agent
+  # Not `contains_any: ["reviewer", ...]`: the manager naming a worker in its prose is
+  # not the manager having called one, and that is precisely the regression here.
+  - type: delegated_to
+    values: ["reviewer"]
   - type: contains_any
-    values: ["reviewer", "finding", "severity"]
+    values: ["finding", "severity"]
   - type: no_blocked_calls
   - type: max_turns
     value: 15

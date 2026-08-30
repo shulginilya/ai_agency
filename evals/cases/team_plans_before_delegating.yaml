@@ -1,0 +1,29 @@
+# The regression this catches: the manager takes a broad, multi-file request and starts
+# delegating fixes immediately, or plans it silently in its own context and never calls
+# `scrum-master` at all. Both read identically in the transcript -- plausible prose, a
+# sensible-looking breakdown -- so an output assertion passes while the planning worker
+# has quietly become dead weight on every run's roster.
+#
+# `tool_called: Agent` cannot separate them either: it is true the moment *any* worker
+# runs. Only `delegated_to` names who actually did.
+name: team_plans_before_delegating
+prompt: >
+  The delegation trace in src/agency/hooks/delegation.py and the live registry in
+  src/agency/obs/agent_state.py are supposed to stay consistent with each other.
+  Work out what would have to change to attribute cost per worker rather than per run,
+  and plan that work.
+profile: eval
+team: engineering
+assertions:
+  - type: succeeded
+  - type: delegated_to
+    values: ["scrum-master"]
+  # Planning must not become doing. The Opus worker on a question that asks for a plan is
+  # the expensive failure mode, and it is invisible unless asserted directly.
+  - type: not_delegated_to
+    values: ["developer"]
+  - type: no_blocked_calls
+  - type: max_turns
+    value: 20
+  - type: max_cost_usd
+    value: 0.80

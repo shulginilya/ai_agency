@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from agency.hooks.delegation import delegations
 from agency.obs.cost import RunRecord
 
 
@@ -64,6 +65,40 @@ def tool_not_called(record: RunRecord, spec: dict[str, Any]) -> Score:
     return Score("tool_not_called", tool not in used, f"used: {used}")
 
 
+def delegated_to(record: RunRecord, spec: dict[str, Any]) -> Score:
+    """Every worker named in `values` ran to completion.
+
+    Reads the trace through `hooks.delegation.delegations`, the same function the CLI
+    and `run_eval.py` use, so "delegated" means one thing everywhere rather than three
+    slightly different walks of `tool_calls`.
+
+    This is *completion*, not invocation. `delegations` reads only `phase == "post"`
+    entries, so a worker whose delegation failed leaves its `pre` entry behind and
+    never appears here -- which is the reading you want: a worker that crashed did not
+    do the work, however much the manager intended it to.
+
+    Names are compared exactly. They are identifiers from the `TEAM` dict, not prose,
+    and the output scorers' case-folding would only hide a typo in a case file.
+    """
+    ran = delegations(record)
+    missing = [str(v) for v in spec["values"] if str(v) not in ran]
+    detail = f"missing: {missing}; ran: {ran}" if missing else f"ran: {ran}"
+    return Score("delegated_to", not missing, detail)
+
+
+def not_delegated_to(record: RunRecord, spec: dict[str, Any]) -> Score:
+    """No worker named in `values` ran -- the other half of "reviewer ran, developer did not".
+
+    Worth asserting on its own: over-delegation is a real regression (the manager sends
+    a planning question to the Opus worker) and it is invisible to every assertion that
+    only checks that *something* was delegated.
+    """
+    ran = delegations(record)
+    found = [str(v) for v in spec["values"] if str(v) in ran]
+    detail = f"unexpectedly ran: {found}" if found else f"ran: {ran}"
+    return Score("not_delegated_to", not found, detail)
+
+
 def no_blocked_calls(record: RunRecord, spec: dict[str, Any]) -> Score:  # noqa: ARG001
     blocked = [c.tool for c in record.tool_calls if c.phase == "blocked"]
     return Score("no_blocked_calls", not blocked, f"blocked: {blocked}" if blocked else "")
@@ -91,6 +126,8 @@ SCORERS: dict[str, Scorer] = {
     "matches_regex": matches_regex,
     "tool_called": tool_called,
     "tool_not_called": tool_not_called,
+    "delegated_to": delegated_to,
+    "not_delegated_to": not_delegated_to,
     "no_blocked_calls": no_blocked_calls,
     "max_cost_usd": max_cost_usd,
     "max_turns": max_turns,

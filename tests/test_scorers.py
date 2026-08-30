@@ -36,6 +36,39 @@ def test_blocked_calls_do_not_count_as_used() -> None:
     assert not score_record(rec, [{"type": "no_blocked_calls"}])[0].passed
 
 
+def test_delegated_to_reads_completed_delegations() -> None:
+    rec = _record("done")
+    rec.record_tool(
+        ToolCall(tool="Agent", phase="post", detail={"agent_type": "scrum-master"})
+    )
+    assert score_record(rec, [{"type": "delegated_to", "values": ["scrum-master"]}])[0].passed
+    assert score_record(rec, [{"type": "not_delegated_to", "values": ["developer"]}])[0].passed
+    assert not score_record(rec, [{"type": "delegated_to", "values": ["developer"]}])[0].passed
+
+
+def test_a_failed_delegation_does_not_count_as_having_run() -> None:
+    # The pre entry exists the moment the manager calls Agent; only the post entry means
+    # the worker finished. Asserting on the pre entry would make "the developer ran" true
+    # for a run where it crashed on its first turn -- exactly the case an eval must catch.
+    rec = _record("done")
+    rec.record_tool(
+        ToolCall(tool="Agent", phase="pre", detail={"agent_type": "developer"})
+    )
+    assert not score_record(rec, [{"type": "delegated_to", "values": ["developer"]}])[0].passed
+    assert score_record(rec, [{"type": "not_delegated_to", "values": ["developer"]}])[0].passed
+
+
+def test_delegated_to_requires_every_named_worker() -> None:
+    rec = _record("done")
+    for worker in ("scrum-master", "reviewer"):
+        rec.record_tool(ToolCall(tool="Agent", phase="post", detail={"agent_type": worker}))
+    spec = {"type": "delegated_to", "values": ["scrum-master", "reviewer"]}
+    assert score_record(rec, [spec])[0].passed
+    score = score_record(rec, [{**spec, "values": ["scrum-master", "test-writer"]}])[0]
+    assert not score.passed
+    assert "test-writer" in score.detail
+
+
 def test_cost_limit() -> None:
     rec = _record("x")
     rec.total_cost_usd = 0.5
