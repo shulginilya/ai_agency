@@ -98,6 +98,18 @@ def teams(rest: Sequence[str]) -> None:
     run("agency", "teams", *rest)
 
 
+def capabilities(rest: Sequence[str]) -> None:
+    """List capability packs.  task capabilities [--seed] """
+    run("agency", "capabilities", *rest)
+
+
+def migrate(rest: Sequence[str]) -> None:
+    """Run database migrations.  task migrate [revision]"""
+    # A deploy step, deliberately not something the app does at startup -- with
+    # `uvicorn --workers N` that would be N processes racing to migrate one schema.
+    run("agency", "migrate", *rest)
+
+
 def serve(rest: Sequence[str]) -> None:
     """Serve the HTTP API.  task serve [--port 8000] [--reload] """
     run("agency", "serve", *rest)
@@ -174,6 +186,8 @@ TASKS: dict[str, Callable[[Sequence[str]], None]] = {
     "repl": repl,
     "team": team,
     "teams": teams,
+    "capabilities": capabilities,
+    "migrate": migrate,
     "serve": serve,
     "doctor": doctor,
     "lint": lint,

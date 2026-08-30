@@ -29,6 +29,44 @@ services:
     stdin_open: true
     tty: true
 
+  # Off unless requested: `docker compose --profile db up`. Most users of this harness
+  # want the file-backed mode, and a Postgres container they did not ask for is a
+  # surprising thing to find running.
+  db:
+    profiles: ["db"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agency}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-agency}
+    volumes:
+      - agency-db:/var/lib/postgresql/data
+    ports:
+      # Loopback only, same reasoning as the API port.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agency} -d ${POSTGRES_DB:-agency}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # One-shot: run migrations, then exit. Deliberately a separate service rather than an
+  # entrypoint step in `api` -- with more than one API replica, N processes would race
+  # to migrate one schema.
+  migrate:
+    <<: *agency-base
+    profiles: ["db"]
+    command: ["migrate"]
+    environment:
+      <<: *agency-env
+      AGENCY_DATABASE_URL: ${AGENCY_DATABASE_URL:?set AGENCY_DATABASE_URL to use the db profile}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
   api:
     <<: *agency-base
     command: ["serve"]
@@ -47,6 +85,21 @@ services:
       AGENCY_API_MAX_CONCURRENT_RUNS: ${AGENCY_API_MAX_CONCURRENT_RUNS:-4}
       AGENCY_API_RUN_TIMEOUT_S: ${AGENCY_API_RUN_TIMEOUT_S:-300}
       AGENCY_API_DOCS_ENABLED: ${AGENCY_API_DOCS_ENABLED:-true}
+      # Empty => no database: packs come from the in-code seed, run records are files,
+      # and agent state is process-global. Point it at the db service below to make
+      # packs editable at runtime and agent state visible across processes.
+      AGENCY_DATABASE_URL: ${AGENCY_DATABASE_URL:-}
+      # Empty => the routes that widen agent powers 404. Set it deliberately.
+      AGENCY_ADMIN_API_KEY: ${AGENCY_ADMIN_API_KEY:-}
+    depends_on:
+      db:
+        # `service_healthy`, not `service_started`: Postgres accepts a TCP connection
+        # well before it will answer a query, so waiting on the port produces a first
+        # request that fails for no visible reason.
+        condition: service_healthy
+        # The API runs perfectly well with no database, so this dependency must not be
+        # what stops it from starting when the profile is off.
+        required: false
     healthcheck:
       # Liveness only. /readyz touches the filesystem, which is not what a restart
       # decision should hinge on.
@@ -56,3 +109,6 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+
+volumes:
+  agency-db:

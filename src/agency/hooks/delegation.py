@@ -8,7 +8,7 @@ how long it ran -- only shows up on the `SubagentStart` / `SubagentStop` events.
 Recorded onto the same `RunRecord` as the tool trace, so an eval case can assert
 "the manager delegated to `reviewer`" the same way it asserts "it called Read".
 
-These hooks have a second consumer: `obs.agent_state.REGISTRY`, which `GET /v1/agents`
+These hooks have a second consumer: the `AgentStateStore`, which `GET /v1/agents`
 reads to report live status. The record is per-run and dies with it; the registry is
 per-process and outlives it. Both are fed from here because this is the only place the
 subagent lifecycle is visible.
@@ -19,9 +19,9 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from agency.obs.agent_state import REGISTRY
 from agency.obs.cost import RunRecord, ToolCall
 from agency.obs.logging import get_logger
+from agency.store.agent_state import AgentStateStore, MemoryAgentStateStore
 
 log = get_logger(__name__)
 
@@ -36,13 +36,26 @@ bundled CLI, so both are checked -- picking one and being wrong would silently a
 every failure to "unknown" rather than raising."""
 
 
-def make_subagent_start_hook(record: RunRecord | None) -> Any:
+def make_subagent_start_hook(
+    record: RunRecord | None, store: AgentStateStore | None = None
+) -> Any:
     """Fires when a worker is spawned. `agent_type` is the key from the TEAM dict.
 
-    `record` is optional because the registry half of this hook must run on every
-    session, whether or not the caller asked for a tool trace. Without a record the
-    hooks still track live state; they just do not write to the run's trace.
+    `record` is optional because the state half of this hook must run on every session,
+    whether or not the caller asked for a tool trace. Without a record the hooks still
+    track live state; they just do not write to the run's trace.
+
+    `store` is where that state goes: the process-global registry by default, or the
+    database when one is configured, which is what makes `GET /v1/agents` report the
+    server rather than whichever `uvicorn` worker answered. Defaulting to the memory
+    store keeps every existing caller -- the CLI, the eval harness, the tests -- on the
+    behaviour they had.
+
+    Neither half may raise. These run on the hot path of every delegation, so a status
+    write that fails must degrade the display, never the run; the store implementations
+    swallow their own errors and this code does not guard them.
     """
+    state = store or MemoryAgentStateStore()
     started: dict[str, float] = {}
 
     async def on_start(
@@ -53,7 +66,7 @@ def make_subagent_start_hook(record: RunRecord | None) -> Any:
         agent_id = str(input_data.get("agent_id", ""))
         agent_type = str(input_data.get("agent_type", "unknown"))
         started[agent_id] = time.monotonic()
-        REGISTRY.record_start(agent_type)
+        await state.record_start(agent_type)
         log.info("delegation.start", agent_type=agent_type, agent_id=agent_id)
         if record is not None:
             record.record_tool(
@@ -73,7 +86,7 @@ def make_subagent_start_hook(record: RunRecord | None) -> Any:
         agent_id = str(input_data.get("agent_id", ""))
         agent_type = str(input_data.get("agent_type", "unknown"))
         elapsed = time.monotonic() - started.pop(agent_id, time.monotonic())
-        REGISTRY.record_stop(agent_type)
+        await state.record_stop(agent_type)
         log.info(
             "delegation.stop",
             agent_type=agent_type,
@@ -119,7 +132,7 @@ def subagent_type_of(tool_input: dict[str, Any]) -> str | None:
     return None
 
 
-def make_delegation_failure_hook() -> Any:
+def make_delegation_failure_hook(store: AgentStateStore | None = None) -> Any:
     """`PostToolUseFailure` on the Agent tool -- the only signal that a delegation broke.
 
     `SubagentStop` cannot carry this: its payload is `agent_id`, `agent_type` and a
@@ -131,6 +144,7 @@ def make_delegation_failure_hook() -> Any:
     worker's own `agent_id` and some other `tool_name`; the `tool_name == "Agent"` test
     is what separates them.
     """
+    state = store or MemoryAgentStateStore()
 
     async def on_failure(
         input_data: dict[str, Any],
@@ -145,7 +159,7 @@ def make_delegation_failure_hook() -> Any:
             # worse than one that only shows up in the log.
             log.warning("delegation.failed_unattributed", payload=str(input_data)[:300])
             return {}
-        REGISTRY.record_failure(agent_type)
+        await state.record_failure(agent_type)
         log.warning(
             "delegation.failed", agent_type=agent_type, error=str(input_data.get("error"))[:300]
         )

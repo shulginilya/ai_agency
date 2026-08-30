@@ -30,11 +30,13 @@ from agency.api.deps import (
 )
 from agency.api.errors import ProblemFallbackMiddleware, install_error_handlers
 from agency.api.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
-from agency.api.routers import agents, health, runs, sessions
+from agency.api.routers import agents, capabilities, health, runs, sessions
 from agency.api.sessions import ConversationFactory, SessionStore
 from agency.api.version import API_VERSION, VERSION
+from agency.capabilities.store import CapabilityStore, make_capability_store
 from agency.config import Settings, get_settings
 from agency.obs.logging import configure_logging, get_logger
+from agency.store.agent_state import AgentStateStore, make_agent_state_store
 
 log = get_logger(__name__)
 
@@ -52,6 +54,14 @@ TAGS: list[dict[str, Any]] = [
     {"name": "runs", "description": "Execute agent runs."},
     {"name": "agents", "description": "Agent discovery: which subagents this server can invoke."},
     {
+        "name": "capabilities",
+        "description": (
+            "Capability packs and standing grants. Reading needs the ordinary API key; "
+            "changing what agents may do needs a separate admin key, and is disabled "
+            "unless one is configured."
+        ),
+    },
+    {
         "name": "sessions",
         "description": (
             "Multi-turn conversations. A session holds a live agent context open across "
@@ -66,6 +76,8 @@ def create_app(
     *,
     runner: Runner | None = None,
     conversation_factory: ConversationFactory | None = None,
+    capability_store: CapabilityStore | None = None,
+    agent_state_store: AgentStateStore | None = None,
     project_root: Path | None = None,
 ) -> FastAPI:
     """Build the ASGI app.
@@ -102,6 +114,11 @@ def create_app(
             max_sessions=settings.api_max_sessions,
             session_idle_ttl_s=settings.api_session_idle_ttl_s,
             session_reap_interval_s=store.reap_interval_s,
+            database=settings.database_backend(),
+            # Whether the surface that widens agent powers is reachable at all. Worth a
+            # line at startup: "disabled" is the safe default and someone will want to
+            # know why their PUT 404s.
+            capability_admin="enabled" if settings.admin_api_key else "disabled",
             docs=settings.api_docs_enabled,
         )
         # The one background task this app runs. It has to be a task rather than the
@@ -110,9 +127,20 @@ def create_app(
         # `SessionStore.reap_forever`. Started here and cancelled below, so it cannot
         # outlive the app or leak on shutdown, which was the original objection to it.
         reaper = asyncio.create_task(store.reap_forever(), name="agency.session-reaper")
+        # Two more background concerns, and only when a database is configured. The sweep
+        # runs once at startup and closes invocations left open by processes that are no
+        # longer alive -- the failure the in-memory registry could not have, because a
+        # dead process took its state with it. The heartbeat is what makes "no longer
+        # alive" a fact rather than a guess, and is why the sweep cannot reap a live
+        # sibling's rows under `uvicorn --workers N`.
+        heartbeat = await _start_agent_state_upkeep(app)
         try:
             yield
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
             # Cancel the reaper first: it and `aclose_all` mutate the same map, and a
             # reap firing mid-shutdown would race the gather for the same session ids.
             reaper.cancel()
@@ -128,6 +156,12 @@ def create_app(
             # including the ones where it would have been the useful number.
             open_sessions = store.count
             await store.aclose_all()
+            # Engines last: the sweep and the stores above may still touch them.
+            # A no-op when no database is configured.
+            with suppress(Exception):
+                from agency.db.engine import dispose_engines
+
+                await dispose_engines()
             log.info(
                 "api.shutdown",
                 in_flight=app.state.slots.in_flight,
@@ -162,6 +196,8 @@ def create_app(
         limit=settings.api_max_sessions,
         idle_ttl_s=settings.api_session_idle_ttl_s,
     )
+    app.state.capabilities = capability_store or make_capability_store(settings)
+    app.state.agent_state = agent_state_store or make_agent_state_store(settings)
 
     install_error_handlers(app)
 
@@ -169,6 +205,8 @@ def create_app(
     app.include_router(runs.router, prefix=f"/{API_VERSION}")
     app.include_router(agents.router, prefix=f"/{API_VERSION}")
     app.include_router(sessions.router, prefix=f"/{API_VERSION}")
+    app.include_router(capabilities.router, prefix=f"/{API_VERSION}")
+    app.include_router(capabilities.grants_router, prefix=f"/{API_VERSION}")
 
     # `add_middleware` prepends, so the LAST one added is the outermost and runs first.
     # Added innermost-first below, which reads backwards but puts each layer where it has
@@ -180,11 +218,50 @@ def create_app(
         settings,
         # sessions.router is what puts DELETE in this list -- the exact case the
         # docstring below warns about.
-        _allowed_methods(health.router, runs.router, agents.router, sessions.router),
+        _allowed_methods(
+            health.router,
+            runs.router,
+            agents.router,
+            sessions.router,
+            capabilities.router,
+            capabilities.grants_router,
+        ),
     )
     app.add_middleware(RequestContextMiddleware)
 
     return app
+
+
+async def _start_agent_state_upkeep(app: FastAPI) -> asyncio.Task[None] | None:
+    """Register this instance, sweep the dead, and keep the heartbeat going.
+
+    Returns `None` with no database, where none of it means anything: a single process
+    observing its own workers has no cross-process question to answer.
+
+    Every step is best-effort. A status table that cannot be reached should degrade the
+    roster display, never stop the server from accepting runs.
+    """
+    store = app.state.agent_state
+    register = getattr(store, "register_instance", None)
+    if register is None:
+        return None
+
+    from agency.store.db_agent_state import HEARTBEAT_INTERVAL_S
+
+    try:
+        await register()
+        swept = await store.sweep_dead_instances()
+        log.info("api.agent_state_ready", swept_invocations=swept)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        log.warning("api.agent_state_upkeep_failed", error=str(exc))
+        return None
+
+    async def beat() -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+            await store.heartbeat()
+
+    return asyncio.create_task(beat(), name="agency.agent-state-heartbeat")
 
 
 def _allowed_methods(*routers: APIRouter) -> list[str]:

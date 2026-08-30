@@ -28,6 +28,7 @@ from agency.api.app import create_app
 from agency.api.deps import _AgentConversation, get_runner, get_slots
 from agency.api.errors import CONTENT_TYPE
 from agency.api.sessions import Conversation, SessionStore
+from agency.capabilities.model import ResolvedGrants
 from agency.config import Profile, Settings
 from agency.obs.agent_state import REGISTRY
 from agency.obs.cost import RunRecord, ToolCall
@@ -72,9 +73,16 @@ class FakeRunner:
         self.tasks: list[Any] = []
 
     async def __call__(
-        self, prompt: str, *, profile: Profile | None = None, team: str | None = None
+        self,
+        prompt: str,
+        *,
+        profile: Profile | None = None,
+        team: str | None = None,
+        grants: ResolvedGrants | None = None,
     ) -> RunRecord:
-        self.calls.append({"prompt": prompt, "profile": profile, "team": team})
+        self.calls.append(
+            {"prompt": prompt, "profile": profile, "team": team, "grants": grants}
+        )
         self.tasks.append(asyncio.current_task())
         if self.delay:
             await asyncio.sleep(self.delay)
@@ -153,7 +161,13 @@ class FakeConversations:
         self.close_delay = close_delay
         self.opened: list[FakeConversation] = []
 
-    async def __call__(self, *, profile: Profile, team: str | None = None) -> Conversation:
+    async def __call__(
+        self,
+        *,
+        profile: Profile,
+        team: str | None = None,
+        grants: ResolvedGrants | None = None,
+    ) -> Conversation:
         conversation = FakeConversation(
             profile,
             team,
@@ -237,7 +251,14 @@ async def test_run_forwards_profile_and_team_to_the_runner(client: httpx.AsyncCl
         "/v1/runs", json={"prompt": "x", "profile": "eval", "team": "engineering"}
     )
     call = client.runner.calls[-1]  # type: ignore[attr-defined]
-    assert call == {"prompt": "x", "profile": "eval", "team": "engineering"}
+    assert call["prompt"] == "x"
+    assert call["profile"] == "eval"
+    assert call["team"] == "engineering"
+    # Resolved, not forwarded raw: the route hands the runner a value, never a request.
+    # No packs were asked for, so this is the shared empty one -- which is what keeps the
+    # ungranted path identical to a run from before grants existed.
+    assert call["grants"] is not None
+    assert call["grants"].is_empty()
 
 
 async def test_an_errored_agent_is_still_a_200(api_settings: Settings) -> None:
