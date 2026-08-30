@@ -37,6 +37,24 @@ def test_reviewer_cannot_modify_anything() -> None:
     assert not WRITE_ISH.intersection(TEAM["reviewer"].tools or [])
 
 
+def test_scrum_master_plans_but_cannot_act() -> None:
+    # Two separate guarantees, and both matter. No write tools, for the same reason as
+    # `reviewer`: a planner that can edit will start "just fixing" what it notices.
+    # And no Agent tool, which is the one specific to this role -- spawn depth is capped
+    # at 1 so a worker's delegation would fail anyway, but the honest place to say
+    # "you propose, the manager delegates" is the tool list, not a runtime error.
+    tools = set(TEAM["scrum-master"].tools or [])
+    assert not WRITE_ISH.intersection(tools)
+    assert not {"Agent", "Task"}.intersection(tools)
+    assert {"Read", "Grep", "Glob"}.issubset(tools), "a planner that cannot read the code"
+
+
+def test_scrum_master_is_not_the_expensive_worker() -> None:
+    # Planning is reading and structuring; `developer` is where the opus budget goes.
+    # Pinned so a later "make the planner smarter" edit is a deliberate one.
+    assert TEAM["scrum-master"].model == "sonnet"
+
+
 def test_test_writer_can_write_and_execute() -> None:
     tools = set(TEAM["test-writer"].tools or [])
     assert {"Write", "Bash"}.issubset(tools)
@@ -78,7 +96,10 @@ def test_team_mode_attaches_workers_and_manager_prompt(
     settings: Settings, tmp_path: Path, profile: str
 ) -> None:
     opts = build_options(
-        profile, settings=settings, project_root=tmp_path, team="engineering"  # type: ignore[arg-type]
+        profile,
+        settings=settings,
+        project_root=tmp_path,
+        team="engineering",  # type: ignore[arg-type]
     )
     assert opts.agents is not None
     assert set(TEAM).issubset(opts.agents)
@@ -95,7 +116,7 @@ def test_team_mode_exposes_every_worker(settings: Settings, tmp_path: Path) -> N
     # A worker defined in TEAM but never reachable from a run is the failure this
     # catches: the manager prompt advertises it and delegation then 404s.
     opts = build_options("dev", settings=settings, project_root=tmp_path, team="engineering")
-    assert {"reviewer", "test-writer", "developer"}.issubset(set(opts.agents or {}))
+    assert {"scrum-master", "reviewer", "test-writer", "developer"}.issubset(set(opts.agents or {}))
 
 
 def test_manager_prompt_advertises_every_worker() -> None:
@@ -103,6 +124,22 @@ def test_manager_prompt_advertises_every_worker() -> None:
     # never gets used, with no error anywhere to say so.
     for name in TEAM:
         assert f"`{name}`" in MANAGER_PROMPT, f"{name} is not named in MANAGER_PROMPT"
+
+
+def test_scrum_master_prompt_names_every_worker_it_can_assign_to() -> None:
+    # The planner is a *second* routing table with the same failure mode: it puts an
+    # owner on every task, so a worker missing from its prompt is one no plan ever
+    # routes to. Worse than the manager case, because the planner cannot see
+    # MANAGER_PROMPT -- a fresh context window is all it gets, so the roster has to be
+    # restated here or it does not exist. It excludes itself: it writes plans, it is
+    # not an owner a plan can name.
+    prompt = TEAM["scrum-master"].prompt
+    for name in TEAM:
+        if name == "scrum-master":
+            continue
+        assert f"`{name}`" in prompt, (
+            f"{name} is unassignable: the scrum-master prompt never names it"
+        )
 
 
 def test_delegation_tool_is_auto_approved_under_both_names(
