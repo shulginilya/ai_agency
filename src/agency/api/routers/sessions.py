@@ -42,6 +42,7 @@ from agency.api.errors import (
     raise_for_auth_failure,
 )
 from agency.api.schemas import (
+    PROBLEM_RESPONSES,
     MessageRequest,
     MessageResponse,
     Problem,
@@ -59,9 +60,8 @@ router = APIRouter(
     tags=["sessions"],
     dependencies=[Depends(require_api_key)],
     responses={
-        401: {"model": Problem, "description": "Missing or invalid API key"},
+        **PROBLEM_RESPONSES,
         404: {"model": Problem, "description": "No such session; it was closed or expired"},
-        422: {"model": Problem, "description": "Request failed validation"},
     },
 )
 

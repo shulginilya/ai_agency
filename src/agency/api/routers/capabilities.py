@@ -27,7 +27,7 @@ from agency.api.deps import (
     require_api_key,
 )
 from agency.api.errors import APIError, NotFound, ValidationFailed
-from agency.api.schemas import Problem
+from agency.api.schemas import PROBLEM_RESPONSES, Problem
 from agency.api.schemas_capabilities import (
     AssignmentInfo,
     AssignmentsResponse,
@@ -48,7 +48,7 @@ router = APIRouter(
     prefix="/capabilities",
     tags=["capabilities"],
     dependencies=[Depends(require_api_key)],
-    responses={401: {"model": Problem, "description": "Missing or invalid API key"}},
+    responses=dict(PROBLEM_RESPONSES),
 )
 
 NAME = Annotated[str, Path(min_length=1, max_length=64, description="The pack's name.")]
@@ -211,7 +211,7 @@ grants_router = APIRouter(
     prefix="/grants",
     tags=["capabilities"],
     dependencies=[Depends(require_api_key)],
-    responses={401: {"model": Problem, "description": "Missing or invalid API key"}},
+    responses=dict(PROBLEM_RESPONSES),
 )
 
 

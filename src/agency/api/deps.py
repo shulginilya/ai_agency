@@ -46,8 +46,23 @@ ADMIN_KEY_HEADER = "X-Admin-Key"
 
 # auto_error=False on both: neither scheme is individually mandatory (either satisfies
 # auth) and we want our own problem+json 401, not FastAPI's default JSON body.
-_api_key_scheme = APIKeyHeader(name=API_KEY_HEADER, auto_error=False)
-_admin_key_scheme = APIKeyHeader(name=ADMIN_KEY_HEADER, auto_error=False)
+#
+# `scheme_name` is not decoration. FastAPI names a security scheme after its *class*, so
+# two `APIKeyHeader`s collapse into one `APIKeyHeader` entry in `components` -- and the
+# survivor was the admin one, which made every authenticated route in the spec (and the
+# Authorize dialog, and the reference page's curl samples) ask for `X-Admin-Key`. These
+# three names are also what `app.ADMIN_SECURITY` refers to, so they are constants rather
+# than literals at the constructor.
+API_KEY_SCHEME = "ApiKey"
+ADMIN_KEY_SCHEME = "AdminKey"
+BEARER_SCHEME = "HTTPBearer"
+
+_api_key_scheme = APIKeyHeader(
+    name=API_KEY_HEADER, scheme_name=API_KEY_SCHEME, auto_error=False
+)
+_admin_key_scheme = APIKeyHeader(
+    name=ADMIN_KEY_HEADER, scheme_name=ADMIN_KEY_SCHEME, auto_error=False
+)
 _bearer_scheme = HTTPBearer(auto_error=False, description="Same value as X-API-Key.")
 
 

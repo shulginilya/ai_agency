@@ -30,7 +30,7 @@ from agency.api.deps import (
     require_api_key,
 )
 from agency.api.errors import RunTimeout, UpstreamError, raise_for_auth_failure
-from agency.api.schemas import Problem, RunRequest, RunResponse
+from agency.api.schemas import PROBLEM_RESPONSES, Problem, RunRequest, RunResponse
 from agency.capabilities.model import Grants, ResolvedGrants
 from agency.obs.logging import get_logger
 
@@ -41,8 +41,7 @@ router = APIRouter(
     tags=["runs"],
     dependencies=[Depends(require_api_key)],
     responses={
-        401: {"model": Problem, "description": "Missing or invalid API key"},
-        422: {"model": Problem, "description": "Request failed validation"},
+        **PROBLEM_RESPONSES,
         502: {"model": Problem, "description": "The agent loop failed"},
         503: {"model": Problem, "description": "No run slot available; retry"},
         504: {"model": Problem, "description": "Run exceeded the server timeout"},

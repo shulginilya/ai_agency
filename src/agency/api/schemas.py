@@ -679,3 +679,24 @@ class Problem(BaseModel):
     detail: str
     instance: str | None = None
     request_id: str | None = None
+
+
+PROBLEM_RESPONSES: dict[int | str, dict[str, Any]] = {
+    401: {"model": Problem, "description": "Missing or invalid API key"},
+    422: {"model": Problem, "description": "Request failed validation"},
+    500: {"model": Problem, "description": "Unexpected server error"},
+}
+"""The failures every `/v1` route can produce, spread over each router's `responses`.
+
+Shared rather than repeated per router for one reason that is not tidiness: **declaring
+a 422 is what stops FastAPI documenting its own `HTTPValidationError`.** For any route
+with a body or a path parameter, FastAPI appends that schema unless a 422 is already
+declared -- and this API never sends it. `errors.py` turns a `RequestValidationError`
+into a problem document like everything else, so a client generated from an
+undeclared-422 spec branches on a body shape that never arrives. Same argument for 500:
+`ProblemFallbackMiddleware` guarantees the shape, so leaving it undocumented is the
+spec lying by omission.
+
+The media type is corrected in one place, `app._install_openapi` -- FastAPI renders a
+`model` under `application/json`, and these go out as `application/problem+json`.
+"""

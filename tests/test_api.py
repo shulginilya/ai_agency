@@ -13,6 +13,7 @@ that belongs in `evals/`.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -26,6 +27,7 @@ from agency.agents.definitions import AGENTS
 from agency.agents.team import TEAM
 from agency.api.app import create_app
 from agency.api.deps import _AgentConversation, get_runner, get_slots
+from agency.api.docs import SCALAR_VERSION
 from agency.api.errors import CONTENT_TYPE
 from agency.api.sessions import Conversation, SessionStore
 from agency.capabilities.model import ResolvedGrants
@@ -953,6 +955,119 @@ async def test_openapi_documents_the_endpoint(client: httpx.AsyncClient) -> None
     schema = (await client.get("/openapi.json")).json()
     assert "/v1/runs" in schema["paths"]
     assert "503" in schema["paths"]["/v1/runs"]["post"]["responses"]
+
+
+async def test_every_documented_error_is_a_problem_document(
+    client: httpx.AsyncClient,
+) -> None:
+    """The spec must describe the body the server actually sends.
+
+    Two ways it used to lie, both of which break a generated client rather than a human
+    reading the page: FastAPI documents its own `HTTPValidationError` on any route with
+    a body or path parameter unless a 422 is declared, and it renders every declared
+    error model under `application/json` while `errors.py` sends
+    `application/problem+json`.
+    """
+    schema = (await client.get("/openapi.json")).json()
+
+    assert "HTTPValidationError" not in json.dumps(schema)
+    assert "Problem" in schema["components"]["schemas"]
+
+    mislabelled = [
+        (path, method, code, sorted(response.get("content", {})))
+        for path, item in schema["paths"].items()
+        for method, operation in item.items()
+        if isinstance(operation, dict)
+        for code, response in operation["responses"].items()
+        if int(code) >= 400
+        and sorted(response.get("content", {})) != ["application/problem+json"]
+    ]
+    assert mislabelled == []
+
+    # Not just "they are all problem+json" -- a route documenting no errors at all would
+    # also pass that. These two are the ones FastAPI would have supplied itself.
+    runs = schema["paths"]["/v1/runs"]["post"]["responses"]
+    assert {"401", "422", "500", "502", "503", "504"} <= set(runs)
+    assert "422" in schema["paths"]["/v1/agents/{agent_id}"]["get"]["responses"]
+
+
+async def test_servers_is_the_public_url_when_one_is_configured(
+    api_settings: Settings,
+) -> None:
+    """Behind a proxy the bind address is not what clients call."""
+    async with make_client(api_settings, FakeRunner()) as c:
+        assert "servers" not in (await c.get("/openapi.json")).json()
+
+    proxied = api_settings.model_copy(update={"api_public_url": "https://api.example.com/"})
+    async with make_client(proxied, FakeRunner()) as c:
+        schema = (await c.get("/openapi.json")).json()
+        assert schema["servers"][0]["url"] == "https://api.example.com"
+
+
+async def test_the_two_api_keys_are_two_security_schemes(client: httpx.AsyncClient) -> None:
+    """Both credentials are `APIKeyHeader`s, and FastAPI names a scheme after its class.
+
+    Unnamed, they collapsed into one `APIKeyHeader` entry whose surviving definition was
+    `X-Admin-Key` -- so the Authorize dialog, and every generated snippet, told callers
+    to send the admin header at endpoints that want the ordinary one.
+    """
+    schema = (await client.get("/openapi.json")).json()
+    schemes = schema["components"]["securitySchemes"]
+
+    assert schemes["ApiKey"]["name"] == "X-API-Key"
+    assert schemes["AdminKey"]["name"] == "X-Admin-Key"
+
+    # An alternative (either of these), which is what the two ordinary credentials are.
+    assert schema["paths"]["/v1/runs"]["post"]["security"] == [{"ApiKey": []}, {"HTTPBearer": []}]
+
+    # And the admin routes: a conjunction, which is the entire point of a second key.
+    # A stray `{"AdminKey": []}` alternative here would document the admin surface as
+    # reachable with an admin key *alone*, or with a read key alone.
+    for path, method in (
+        ("/v1/capabilities/{name}", "put"),
+        ("/v1/capabilities/{name}", "delete"),
+        ("/v1/grants", "post"),
+    ):
+        assert schema["paths"][path][method]["security"] == [
+            {"ApiKey": [], "AdminKey": []},
+            {"HTTPBearer": [], "AdminKey": []},
+        ], (path, method)
+
+
+async def test_the_reference_ui_renders_and_points_at_this_app(
+    client: httpx.AsyncClient,
+) -> None:
+    """`/reference` is a shell around `/openapi.json` -- assert it is wired to ours."""
+    response = await client.get("/reference")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert f"@scalar/api-reference@{SCALAR_VERSION}" in response.text
+    assert '"url": "/openapi.json"' in response.text
+    # Off explicitly, and worth a test: these default to ON in every Scalar wrapper, so
+    # a future refactor that reaches for `scalar-fastapi` silently starts phoning home
+    # and puts an "Ask AI" button on a page describing a private API.
+    assert '"telemetry": false' in response.text
+    assert '"agent": {"disabled": true}' in response.text
+    # A UI is not part of the API contract.
+    assert "/reference" not in (await client.get("/openapi.json")).json()["paths"]
+
+
+async def test_the_reference_ui_goes_away_with_the_docs(api_settings: Settings) -> None:
+    quiet = api_settings.model_copy(update={"api_docs_enabled": False})
+    async with make_client(quiet, FakeRunner()) as c:
+        assert (await c.get("/reference")).status_code == 404
+
+
+async def test_the_scalar_bundle_url_is_overridable(api_settings: Settings) -> None:
+    """The airgapped case: same page, bundle served from wherever the operator put it."""
+    self_hosted = api_settings.model_copy(
+        update={"api_docs_js_url": "https://assets.internal/scalar.js"}
+    )
+    async with make_client(self_hosted, FakeRunner()) as c:
+        body = (await c.get("/reference")).text
+        assert "https://assets.internal/scalar.js" in body
+        assert "jsdelivr" not in body
 
 
 async def test_docs_can_be_switched_off(api_settings: Settings) -> None:

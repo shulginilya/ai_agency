@@ -32,7 +32,13 @@ from fastapi import APIRouter, Depends, Path, status
 
 from agency.api.deps import AgentStateDep, CapabilitiesDep, require_api_key
 from agency.api.errors import NotFound
-from agency.api.schemas import AgentInfo, AgentsResponse, Problem, known_agent_names
+from agency.api.schemas import (
+    PROBLEM_RESPONSES,
+    AgentInfo,
+    AgentsResponse,
+    Problem,
+    known_agent_names,
+)
 
 router = APIRouter(
     prefix="/agents",
@@ -40,7 +46,7 @@ router = APIRouter(
     # Behind auth now that it exposes something real: the roster leaks which tools each
     # worker holds, which is a map of the harness's write/exec surface.
     dependencies=[Depends(require_api_key)],
-    responses={401: {"model": Problem, "description": "Missing or invalid API key"}},
+    responses=dict(PROBLEM_RESPONSES),
 )
 
 

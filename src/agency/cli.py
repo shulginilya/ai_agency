@@ -239,7 +239,7 @@ def serve(
             f"profile: [bold]{settings.profile}[/bold]  |  "
             f"auth: [bold]{'api-key' if settings.api_key else 'open'}[/bold]  |  "
             f"agent: [bold]{settings.agent_auth_source()}[/bold]  |  "
-            f"docs: {'/docs' if settings.api_docs_enabled else 'disabled'}",
+            f"docs: {'/docs, /reference' if settings.api_docs_enabled else 'disabled'}",
             title="agency serve",
             expand=False,
         )

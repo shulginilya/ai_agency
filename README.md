@@ -102,7 +102,7 @@ Run `python tasks.py` with no arguments to see the same list.
 ## HTTP API
 
 ```bash
-python tasks.py serve                       # http://127.0.0.1:8000, docs at /docs
+python tasks.py serve                       # http://127.0.0.1:8000
 curl -s localhost:8000/healthz
 curl -s localhost:8000/v1/runs -H 'content-type: application/json' \
      -d '{"prompt":"List the files in the workspace."}'
@@ -110,6 +110,18 @@ curl -s localhost:8000/v1/runs -H 'content-type: application/json' \
 
 The web stack is an optional extra (`pip install -e ".[api]"`) so the CLI and the eval
 suite still install into an image with no web dependencies.
+
+Three views of the same document, all switched off together by
+`AGENCY_API_DOCS_ENABLED=false`:
+
+| Path | What it is |
+| --- | --- |
+| `/reference` | Scalar. Sidebar, search, dark mode, and a request client that emits curl/python/js. |
+| `/docs` | Swagger UI, FastAPI's default. |
+| `/openapi.json` | The spec itself. Errors are documented as `application/problem+json`, matching what the server sends, so a generated client parses them. |
+
+Both UIs load their JavaScript from a CDN, so they are blank with no egress;
+`AGENCY_API_DOCS_JS_URL` repoints `/reference` at a self-hosted bundle.
 
 | Route | Purpose |
 |---|---|

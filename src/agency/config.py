@@ -200,6 +200,18 @@ class Settings(BaseSettings):
     # Swagger/ReDoc/openapi.json. Turn off in production.
     api_docs_enabled: bool = True
 
+    # The base URL callers actually reach this API on, when it is not what the process
+    # binds to -- i.e. behind a reverse proxy. Written into the OpenAPI `servers` list,
+    # which is what a generated client and a saved `openapi.json` resolve paths against.
+    # Empty leaves the document relative, which is correct for the docs page this app
+    # serves itself.
+    api_public_url: str = ""
+
+    # Where `/reference` loads the Scalar bundle from. Empty => the pinned CDN URL in
+    # `api/docs.py`. Point it at a self-hosted copy of the same file for a deployment
+    # with no egress, which is the one case where the docs page is otherwise blank.
+    api_docs_js_url: str = ""
+
     def agent_auth_env(self) -> dict[str, str]:
         """Credentials for the SDK subprocess, as environment variables.
 

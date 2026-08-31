@@ -1,0 +1,2465 @@
+{
+ "openapi": "3.1.0",
+ "info": {
+  "title": "agency",
+  "summary": "Run and converse with the `agency` agent harness over HTTP.",
+  "description": "HTTP surface for the `agency` harness.\n\nEvery endpoint runs the same code path as the CLI: options are built by\n`agency.options.build_options`, so a run over HTTP and a run from `agency run` are\nconfigured identically. Errors are [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)\nproblem documents.\n",
+  "version": "0.1.0"
+ },
+ "paths": {
+  "/healthz": {
+   "get": {
+    "tags": [
+     "health"
+    ],
+    "summary": "Liveness probe",
+    "operationId": "healthz_healthz_get",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Health"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/readyz": {
+   "get": {
+    "tags": [
+     "health"
+    ],
+    "summary": "Readiness probe",
+    "operationId": "readyz_readyz_get",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Readiness"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/runs": {
+   "post": {
+    "tags": [
+     "runs"
+    ],
+    "summary": "Run one prompt to completion",
+    "operationId": "create_run_v1_runs_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RunRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "200": {
+      "description": "The completed run, including its tool and delegation trace.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RunResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "502": {
+      "description": "The agent loop failed",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "503": {
+      "description": "No run slot available; retry",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "504": {
+      "description": "Run exceeded the server timeout",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ]
+   }
+  },
+  "/v1/agents": {
+   "get": {
+    "tags": [
+     "agents"
+    ],
+    "summary": "List the agents this server can invoke",
+    "operationId": "list_agents_v1_agents_get",
+    "responses": {
+     "200": {
+      "description": "The subagent roster: each agent's model, tools and turn cap, plus its live status in this process.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AgentsResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ]
+   }
+  },
+  "/v1/agents/{agent_id}": {
+   "get": {
+    "tags": [
+     "agents"
+    ],
+    "summary": "Retrieve one agent by id",
+    "description": "One roster entry, resolved by id.\n\nSame data and same status source as the collection, so a client can poll a single\nagent without pulling and filtering the whole roster.\n\n404, not an empty 200: an unknown id is a caller error -- a stale name pinned in a\nconfig, or a typo -- and returning a body for it would let that error survive as far\nas `POST /v1/runs`, where it fails much less legibly. The bound on `agent_id` keeps\na junk path segment out of the error body; over it, the 422 is the honest answer,\nsince no agent name is 64 characters long.",
+    "operationId": "get_agent_v1_agents__agent_id__get",
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "agent_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 64,
+       "description": "The agent's `id` from `GET /v1/agents` (equal to its name today).",
+       "title": "Agent Id"
+      },
+      "description": "The agent's `id` from `GET /v1/agents` (equal to its name today)."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The agent's model, tools, turn cap and availability, plus its live status in this process.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AgentInfo"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No agent with that id",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/sessions": {
+   "get": {
+    "tags": [
+     "sessions"
+    ],
+    "summary": "List open sessions",
+    "description": "What this process is holding open, oldest first.\n\nPer-process, like `GET /v1/agents`' status: sessions are local subprocesses, so with\nmore than one uvicorn worker each worker lists only its own. It is an operational\nview -- \"what is this box holding\" -- not a user's conversation history.",
+    "operationId": "list_sessions_v1_sessions_get",
+    "responses": {
+     "200": {
+      "description": "Every session this process currently holds open.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SessionsResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such session; it was closed or expired",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ]
+   },
+   "post": {
+    "tags": [
+     "sessions"
+    ],
+    "summary": "Open a conversation",
+    "description": "Connect a session and hold it open.\n\n201, not 200: this creates a server-side resource -- a live SDK subprocess -- that\nthe caller is now responsible for closing. `expires_at` in the body is the safety\nnet if they do not.\n\nThe profile is resolved here rather than in the store, so what comes back names the\nprofile the session is actually running, not `null` meaning \"whatever the server\nwas configured with at the time\".",
+    "operationId": "open_session_v1_sessions_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SessionCreateRequest"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "201": {
+      "description": "The new session. Send messages to it, then close it.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SessionInfo"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such session; it was closed or expired",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "503": {
+      "description": "No session slot available; retry",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ]
+   }
+  },
+  "/v1/sessions/{session_id}": {
+   "get": {
+    "tags": [
+     "sessions"
+    ],
+    "summary": "Retrieve one session",
+    "description": "Poll one session. `status` is what a client waits on before sending a turn, and\na 404 is the honest answer for a handle that has expired -- see `SessionStore.get`.",
+    "operationId": "get_session_v1_sessions__session_id__get",
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "session_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 64,
+       "description": "The `id` returned by `POST /v1/sessions`.",
+       "title": "Session Id"
+      },
+      "description": "The `id` returned by `POST /v1/sessions`."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "The session's status, turn count and expiry.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SessionInfo"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such session; it was closed or expired",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "tags": [
+     "sessions"
+    ],
+    "summary": "Close a conversation",
+    "description": "Release the subprocess and the context.\n\nRefuses while a turn is in flight rather than tearing the client out from under it:\nthat would surface to the caller mid-turn as a 502 with no explanation. The wait is\nbounded by the turn's own timeout, and a client that has given up entirely does not\nneed this endpoint at all -- the idle reaper collects the session either way.\n\n204 and idempotent-ish: a `DELETE` of an id that has already been closed or reaped\nis a 404 from `sessions.get`, which is the truthful answer to \"is this handle live\".",
+    "operationId": "close_session_v1_sessions__session_id__delete",
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "session_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 64,
+       "description": "The `id` returned by `POST /v1/sessions`.",
+       "title": "Session Id"
+      },
+      "description": "The `id` returned by `POST /v1/sessions`."
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such session; it was closed or expired",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "A turn is in flight; wait for it to finish",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/sessions/{session_id}/messages": {
+   "post": {
+    "tags": [
+     "sessions"
+    ],
+    "summary": "Send one message and get the reply",
+    "description": "One turn of the conversation.\n\nA turn takes a `RunSlots` slot as well as the session lock. An open session is idle\nweight -- a subprocess and some memory -- but a *running* turn is exactly as\nexpensive as a `POST /v1/runs`, so the two endpoints share one bound on concurrent\nmodel work. Without that, N sessions would be N ways around the run cap.\n\n`is_error=True` inside `run` is still a 200, same contract as `POST /v1/runs`. What\ndiffers is the failure handling: a timeout or a transport error cancels the drain\nmid-stream and leaves the SDK client in an indeterminate state, so `SessionStore`\ncloses the session on the way out. The 504 and 502 bodies say so, because \"retry the\nsame session id\" would otherwise be the obvious and wrong next move.",
+    "operationId": "send_message_v1_sessions__session_id__messages_post",
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "session_id",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 64,
+       "description": "The `id` returned by `POST /v1/sessions`.",
+       "title": "Session Id"
+      },
+      "description": "The `id` returned by `POST /v1/sessions`."
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/MessageRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "The completed turn, including its tool and delegation trace.",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MessageResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such session; it was closed or expired",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "A turn is already in flight on this session",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "502": {
+      "description": "The agent loop failed; the session was closed",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "503": {
+      "description": "No run slot available; retry",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "504": {
+      "description": "Turn exceeded the server timeout",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/capabilities": {
+   "get": {
+    "tags": [
+     "capabilities"
+    ],
+    "summary": "List capability packs",
+    "operationId": "list_capabilities_v1_capabilities_get",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/CapabilitiesResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ]
+   }
+  },
+  "/v1/capabilities/{name}/history": {
+   "get": {
+    "tags": [
+     "capabilities"
+    ],
+    "summary": "Every revision of one pack",
+    "description": "The audit trail for one pack.\n\nThis is what replaces `git log` once the database is authoritative: every edit is a\nnew immutable revision, and a completed run names the revision id it held.",
+    "operationId": "capability_history_v1_capabilities__name__history_get",
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "name",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 64,
+       "description": "The pack's name.",
+       "title": "Name"
+      },
+      "description": "The pack's name."
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/CapabilityHistoryResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "No such capability",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/capabilities/{name}": {
+   "put": {
+    "tags": [
+     "capabilities"
+    ],
+    "summary": "Create a pack, or add a revision to one",
+    "description": "Idempotent on content: identical content does not mint a revision.\n\nPUT rather than PATCH because a revision is whole -- there is no partial edit of an\nimmutable row, and offering one would suggest the previous content is still in play.",
+    "operationId": "put_capability_v1_capabilities__name__put",
+    "security": [
+     {
+      "ApiKey": [],
+      "AdminKey": []
+     },
+     {
+      "HTTPBearer": [],
+      "AdminKey": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "name",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 64,
+       "description": "The pack's name.",
+       "title": "Name"
+      },
+      "description": "The pack's name."
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/CapabilityWrite"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/CapabilityInfo"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "The pack could never be honoured",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "404": {
+      "description": "Admin API disabled",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "409": {
+      "description": "No database configured",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    }
+   },
+   "delete": {
+    "tags": [
+     "capabilities"
+    ],
+    "summary": "Archive a pack",
+    "description": "Archive, never delete. `run_grant` rows reference a pack forever, and a run whose\ncapability vanished is a run nobody can explain.",
+    "operationId": "delete_capability_v1_capabilities__name__delete",
+    "security": [
+     {
+      "ApiKey": [],
+      "AdminKey": []
+     },
+     {
+      "HTTPBearer": [],
+      "AdminKey": []
+     }
+    ],
+    "parameters": [
+     {
+      "name": "name",
+      "in": "path",
+      "required": true,
+      "schema": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 64,
+       "description": "The pack's name.",
+       "title": "Name"
+      },
+      "description": "The pack's name."
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    }
+   }
+  },
+  "/v1/capabilities/seed": {
+   "post": {
+    "tags": [
+     "capabilities"
+    ],
+    "summary": "Write the in-code seed registry into the database",
+    "operationId": "seed_v1_capabilities_seed_post",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SeedResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": [],
+      "AdminKey": []
+     },
+     {
+      "HTTPBearer": [],
+      "AdminKey": []
+     }
+    ]
+   }
+  },
+  "/v1/capabilities/reload": {
+   "post": {
+    "tags": [
+     "capabilities"
+    ],
+    "summary": "Drop this process's registry cache",
+    "operationId": "reload_v1_capabilities_reload_post",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ReloadResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": [],
+      "AdminKey": []
+     },
+     {
+      "HTTPBearer": [],
+      "AdminKey": []
+     }
+    ]
+   }
+  },
+  "/v1/grants": {
+   "get": {
+    "tags": [
+     "capabilities"
+    ],
+    "summary": "Standing grants",
+    "description": "Assignments applied to every matching run before the caller asks for anything.",
+    "operationId": "list_grants_v1_grants_get",
+    "responses": {
+     "200": {
+      "description": "Successful Response",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AssignmentsResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": []
+     },
+     {
+      "HTTPBearer": []
+     }
+    ]
+   },
+   "post": {
+    "tags": [
+     "capabilities"
+    ],
+    "summary": "Add a standing grant",
+    "operationId": "add_grant_v1_grants_post",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/AssignmentWrite"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": [],
+      "AdminKey": []
+     },
+     {
+      "HTTPBearer": [],
+      "AdminKey": []
+     }
+    ]
+   },
+   "delete": {
+    "tags": [
+     "capabilities"
+    ],
+    "summary": "Remove a standing grant",
+    "description": "Disables rather than deletes, so the history of what was once granted survives.",
+    "operationId": "remove_grant_v1_grants_delete",
+    "requestBody": {
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/AssignmentWrite"
+       }
+      }
+     },
+     "required": true
+    },
+    "responses": {
+     "204": {
+      "description": "Successful Response"
+     },
+     "401": {
+      "description": "Missing or invalid API key",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "422": {
+      "description": "Request failed validation",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     },
+     "500": {
+      "description": "Unexpected server error",
+      "content": {
+       "application/problem+json": {
+        "schema": {
+         "$ref": "#/components/schemas/Problem"
+        }
+       }
+      }
+     }
+    },
+    "security": [
+     {
+      "ApiKey": [],
+      "AdminKey": []
+     },
+     {
+      "HTTPBearer": [],
+      "AdminKey": []
+     }
+    ]
+   }
+  }
+ },
+ "components": {
+  "schemas": {
+   "AgentInfo": {
+    "properties": {
+     "id": {
+      "type": "string",
+      "minLength": 1,
+      "title": "Id",
+      "description": "Stable identity. Equal to `name` today; it exists separately so a worker can be renamed without breaking clients that key off it."
+     },
+     "name": {
+      "type": "string",
+      "title": "Name",
+      "description": "Key the manager invokes this agent by, e.g. 'reviewer'."
+     },
+     "status": {
+      "$ref": "#/components/schemas/AgentStatus",
+      "description": "Live state in THIS server process, from the subagent hook stream. Runs are in-process, so an agent reads `running` only while this server is actually invoking it -- with uvicorn --workers N each worker reports its own view."
+     },
+     "description": {
+      "type": "string",
+      "title": "Description",
+      "description": "When the agent should be used. This is what drives the model's routing."
+     },
+     "model": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Model",
+      "description": "Model alias ('sonnet', 'opus', ...) or full ID. None inherits the run's."
+     },
+     "tools": {
+      "anyOf": [
+       {
+        "items": {
+         "type": "string"
+        },
+        "type": "array"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Tools",
+      "description": "Tools the agent may use. None means it inherits the main thread's set."
+     },
+     "max_turns": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Max Turns",
+      "description": "Turn cap for one invocation. None means the run's default applies."
+     },
+     "availability": {
+      "type": "string",
+      "enum": [
+       "always",
+       "team"
+      ],
+      "title": "Availability",
+      "description": "'always' -- loaded on every run. 'team' -- only present when the run is started with team=<name>; see the `team` field for which one."
+     },
+     "team": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Team",
+      "description": "Name of the team this worker belongs to, or null for an always-available agent. Pass this as `team` on POST /v1/runs or POST /v1/sessions to reach it."
+     },
+     "grantable": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Grantable",
+      "description": "Capability packs this agent may hold. Pass one under `grants.agents` on a run or session request."
+     },
+     "barred": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Barred",
+      "description": "Packs this agent may never hold, because a ceiling forbids a tool they contain. Named explicitly so a refusal is discoverable before it happens rather than arriving as an apparently arbitrary 422."
+     },
+     "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "title": "Updated At",
+      "description": "UTC time this agent entered its current status. Never null: an agent that has not run reports the time this server started observing, because it has genuinely been idle since then. Use `invocations == 0` to tell 'never ran' from 'ran and finished' -- do not infer it from the timestamp. Not a definition timestamp: editing team.py does not move it."
+     },
+     "invocations": {
+      "type": "integer",
+      "title": "Invocations",
+      "description": "Times this agent has been started in this process. Resets on restart.",
+      "default": 0
+     }
+    },
+    "type": "object",
+    "required": [
+     "id",
+     "name",
+     "status",
+     "description",
+     "availability",
+     "updated_at"
+    ],
+    "title": "AgentInfo",
+    "description": "One subagent the server can invoke.\n\nDeliberately not the whole `AgentDefinition`: `prompt` is the agent's system prompt\nand is an implementation detail, not a wire contract -- publishing it would make\nevery prompt tweak a breaking API change. What is here is what a caller needs to\nchoose an agent and predict what it can do."
+   },
+   "AgentStatus": {
+    "type": "string",
+    "enum": [
+     "idle",
+     "starting",
+     "running",
+     "paused",
+     "error",
+     "stopped"
+    ],
+    "title": "AgentStatus",
+    "description": "The app renders one pill per value. Adding a member is a breaking change\nfor any client that has not shipped support for it \u2014 which is the whole\npoint of it being an enum in the spec rather than a free string.\n\n`(str, Enum)` rather than `enum.StrEnum`: StrEnum is 3.11+, and this project\ndeclares `requires-python = \">=3.10\"`. On 3.10 the import alone raises and takes\nthe whole API down with it. The two serialise identically here.\n\nNot every member is reachable today. What the SDK hook stream can actually tell us\nis start, stop and delegation failure, which yields `idle`, `running` and `error`.\n`starting`, `paused` and `stopped` are reserved -- kept because removing a member is\nas breaking as adding one, but nothing emits them:\n\n- `starting` would have to come from the `Agent` PreToolUse, which also fires for\n  calls the guardrail then denies. There is no matching event on the deny path, so\n  the count would leak and wedge an agent in `starting` forever. Left unemitted\n  rather than shipped wedge-prone.\n- `paused` / `stopped` have no source at all: the SDK exposes `interrupt()` on the\n  main session, not on individual workers, so a worker is never paused or stopped\n  as a distinct state -- it is running or it is gone."
+   },
+   "AgentsResponse": {
+    "properties": {
+     "agents": {
+      "items": {
+       "$ref": "#/components/schemas/AgentInfo"
+      },
+      "type": "array",
+      "title": "Agents"
+     },
+     "count": {
+      "type": "integer",
+      "title": "Count",
+      "description": "Length of `agents`. Redundant on purpose -- it saves clients a scan."
+     }
+    },
+    "type": "object",
+    "required": [
+     "agents",
+     "count"
+    ],
+    "title": "AgentsResponse",
+    "description": "Body of `GET /v1/agents`: the subagent roster.\n\nOnly subagents are listed. The manager is not one -- it is the main thread agent you\ntalk to, so it has no name to invoke and nothing to discover; `team=<name>` on\n`POST /v1/runs` is what selects it and its workers. See `agents/team.py`.\n\nKept an envelope rather than a bare array so fields can be added without breaking\nclients, and because a top-level JSON array is awkward to extend."
+   },
+   "AssignmentInfo": {
+    "properties": {
+     "scope": {
+      "type": "string",
+      "enum": [
+       "lead",
+       "team",
+       "agent"
+      ],
+      "title": "Scope"
+     },
+     "subject": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Subject",
+      "description": "Team name for 'team', agent name for 'agent', null for 'lead'."
+     },
+     "capability": {
+      "type": "string",
+      "title": "Capability"
+     }
+    },
+    "type": "object",
+    "required": [
+     "scope",
+     "subject",
+     "capability"
+    ],
+    "title": "AssignmentInfo",
+    "description": "One standing grant: applied to every matching run, before the caller asks."
+   },
+   "AssignmentWrite": {
+    "properties": {
+     "scope": {
+      "type": "string",
+      "enum": [
+       "lead",
+       "team",
+       "agent"
+      ],
+      "title": "Scope"
+     },
+     "subject": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Subject"
+     },
+     "capability": {
+      "type": "string",
+      "title": "Capability"
+     }
+    },
+    "additionalProperties": false,
+    "type": "object",
+    "required": [
+     "scope",
+     "capability"
+    ],
+    "title": "AssignmentWrite"
+   },
+   "AssignmentsResponse": {
+    "properties": {
+     "assignments": {
+      "items": {
+       "$ref": "#/components/schemas/AssignmentInfo"
+      },
+      "type": "array",
+      "title": "Assignments"
+     },
+     "count": {
+      "type": "integer",
+      "title": "Count"
+     }
+    },
+    "type": "object",
+    "required": [
+     "assignments",
+     "count"
+    ],
+    "title": "AssignmentsResponse"
+   },
+   "CapabilitiesResponse": {
+    "properties": {
+     "capabilities": {
+      "items": {
+       "$ref": "#/components/schemas/CapabilityInfo"
+      },
+      "type": "array",
+      "title": "Capabilities"
+     },
+     "count": {
+      "type": "integer",
+      "title": "Count"
+     },
+     "source": {
+      "type": "string",
+      "title": "Source",
+      "description": "'database' or 'seed'. Worth publishing: the two are edited very differently -- one through this API, the other by shipping a commit."
+     }
+    },
+    "type": "object",
+    "required": [
+     "capabilities",
+     "count",
+     "source"
+    ],
+    "title": "CapabilitiesResponse",
+    "description": "Body of `GET /v1/capabilities`. An envelope, for the same reason `AgentsResponse`\nis one: a bare array cannot grow a field."
+   },
+   "CapabilityHistoryResponse": {
+    "properties": {
+     "name": {
+      "type": "string",
+      "title": "Name"
+     },
+     "revisions": {
+      "items": {
+       "$ref": "#/components/schemas/CapabilityInfo"
+      },
+      "type": "array",
+      "title": "Revisions"
+     }
+    },
+    "type": "object",
+    "required": [
+     "name",
+     "revisions"
+    ],
+    "title": "CapabilityHistoryResponse",
+    "description": "Every revision of one pack, oldest first."
+   },
+   "CapabilityInfo": {
+    "properties": {
+     "name": {
+      "type": "string",
+      "title": "Name"
+     },
+     "description": {
+      "type": "string",
+      "title": "Description",
+      "description": "What the pack is for. This is what a human reads when approving it."
+     },
+     "tools": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Tools"
+     },
+     "skills": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Skills"
+     },
+     "mcp_servers": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Mcp Servers"
+     },
+     "prompt_note": {
+      "type": "string",
+      "title": "Prompt Note",
+      "description": "Appended to the grantee's prompt. A tool a worker was never told it has is a tool it will not use."
+     },
+     "revision": {
+      "type": "integer",
+      "title": "Revision",
+      "description": "1-based. 0 means this came from the in-code seed, not the database."
+     },
+     "revision_id": {
+      "anyOf": [
+       {
+        "type": "integer"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Revision Id",
+      "description": "Database id of this exact content. Pinned on every run that held the pack, which is what keeps a completed run explicable after a later edit."
+     }
+    },
+    "type": "object",
+    "required": [
+     "name",
+     "description",
+     "tools",
+     "skills",
+     "mcp_servers",
+     "prompt_note",
+     "revision"
+    ],
+    "title": "CapabilityInfo",
+    "description": "One pack, at a given revision."
+   },
+   "CapabilityWrite": {
+    "properties": {
+     "name": {
+      "type": "string",
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "title": "Name"
+     },
+     "description": {
+      "type": "string",
+      "minLength": 1,
+      "title": "Description",
+      "description": "Mandatory. A capability nobody can explain is one nobody should approve."
+     },
+     "tools": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Tools"
+     },
+     "skills": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Skills"
+     },
+     "mcp_servers": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Mcp Servers",
+      "description": "Must already be loaded by this server. A pack may scope a worker to an existing MCP server; it may not introduce one."
+     },
+     "prompt_note": {
+      "type": "string",
+      "title": "Prompt Note",
+      "default": ""
+     }
+    },
+    "additionalProperties": false,
+    "type": "object",
+    "required": [
+     "name",
+     "description"
+    ],
+    "title": "CapabilityWrite",
+    "description": "Body of `POST`/`PUT /v1/capabilities`.\n\nNo `revision` field: revisions are minted, never chosen. A caller that could pick one\ncould overwrite history, which is the property this whole table exists to prevent."
+   },
+   "GrantsModel": {
+    "properties": {
+     "lead": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Lead",
+      "description": "Packs for the main thread -- the manager in team mode, else the agent."
+     },
+     "team": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Team",
+      "description": "Packs for every worker of the selected team. A worker whose ceiling forbids a pack is skipped rather than failing the run; see `skipped_grants` on the response."
+     },
+     "agents": {
+      "additionalProperties": {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      "type": "object",
+      "title": "Agents",
+      "description": "Packs for one named agent. Unlike `team`, a ceiling violation here is a 422 -- you named the agent, so a silent drop would hide your mistake."
+     }
+    },
+    "additionalProperties": false,
+    "type": "object",
+    "title": "GrantsModel",
+    "description": "Capability packs to attach to this run, by scope.\n\nNames only. A free-form tool list here would be simpler and strictly worse: it moves\nthe security decision from a reviewed registry to the call site, it cannot carry the\nprompt note that makes a granted tool actually get used, and it makes\n`GET /v1/capabilities` meaningless."
+   },
+   "Health": {
+    "properties": {
+     "status": {
+      "type": "string",
+      "const": "ok",
+      "title": "Status",
+      "default": "ok"
+     },
+     "version": {
+      "type": "string",
+      "title": "Version"
+     }
+    },
+    "type": "object",
+    "required": [
+     "version"
+    ],
+    "title": "Health",
+    "description": "Liveness. Cheap and dependency-free by design -- a liveness probe that checks\ndependencies restarts the process when a dependency blips, which is backwards."
+   },
+   "MessageRequest": {
+    "properties": {
+     "prompt": {
+      "type": "string",
+      "maxLength": 20000,
+      "minLength": 1,
+      "title": "Prompt",
+      "description": "The next turn of the conversation."
+     }
+    },
+    "additionalProperties": false,
+    "type": "object",
+    "required": [
+     "prompt"
+    ],
+    "title": "MessageRequest",
+    "description": "Body of `POST /v1/sessions/{session_id}/messages`.\n\nOnly a prompt. `profile` and `team` are absent on purpose and, because of\n`extra=\"forbid\"`, sending either is a 422 rather than a silent no-op: they were\nbaked into the `ClaudeAgentOptions` this session connected with, so there is no\nhonest way to honour them mid-conversation. Open a new session instead."
+   },
+   "MessageResponse": {
+    "properties": {
+     "session_id": {
+      "type": "string",
+      "title": "Session Id"
+     },
+     "turn": {
+      "type": "integer",
+      "title": "Turn",
+      "description": "1-based index of this turn within the session. `run.run_id` is per-turn."
+     },
+     "run": {
+      "$ref": "#/components/schemas/RunResponse"
+     }
+    },
+    "type": "object",
+    "required": [
+     "session_id",
+     "turn",
+     "run"
+    ],
+    "title": "MessageResponse",
+    "description": "Result of one turn.\n\nThe turn's result is nested as `run` rather than flattened alongside `session_id`,\nso it is the *same* object `POST /v1/runs` returns -- a client can render a turn and\na one-shot run with one code path, and a field added to `RunResponse` cannot collide\nwith a session field."
+   },
+   "Problem": {
+    "properties": {
+     "type": {
+      "type": "string",
+      "title": "Type"
+     },
+     "title": {
+      "type": "string",
+      "title": "Title"
+     },
+     "status": {
+      "type": "integer",
+      "title": "Status"
+     },
+     "detail": {
+      "type": "string",
+      "title": "Detail"
+     },
+     "instance": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Instance"
+     },
+     "request_id": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Request Id"
+     }
+    },
+    "type": "object",
+    "required": [
+     "type",
+     "title",
+     "status",
+     "detail"
+    ],
+    "title": "Problem",
+    "description": "RFC 9457 problem document. Declared so it shows up in the OpenAPI schema; the\nresponses themselves are built in `errors.py`."
+   },
+   "Readiness": {
+    "properties": {
+     "status": {
+      "type": "string",
+      "enum": [
+       "ready",
+       "degraded"
+      ],
+      "title": "Status"
+     },
+     "checks": {
+      "additionalProperties": {
+       "type": "string"
+      },
+      "type": "object",
+      "title": "Checks"
+     },
+     "capacity": {
+      "additionalProperties": {
+       "type": "integer"
+      },
+      "type": "object",
+      "title": "Capacity"
+     }
+    },
+    "type": "object",
+    "required": [
+     "status",
+     "checks",
+     "capacity"
+    ],
+    "title": "Readiness",
+    "description": "Readiness. Checks the things a run actually needs before accepting traffic."
+   },
+   "ReloadResponse": {
+    "properties": {
+     "reloaded": {
+      "type": "boolean",
+      "title": "Reloaded",
+      "default": true
+     },
+     "capabilities": {
+      "type": "integer",
+      "title": "Capabilities"
+     },
+     "detail": {
+      "type": "string",
+      "title": "Detail",
+      "description": "Cross-worker note: this reloads THIS process only. Other workers pick the change up within AGENCY_CAPABILITY_CACHE_TTL_S."
+     }
+    },
+    "type": "object",
+    "required": [
+     "capabilities",
+     "detail"
+    ],
+    "title": "ReloadResponse",
+    "description": "Result of dropping the registry cache."
+   },
+   "RunRequest": {
+    "properties": {
+     "prompt": {
+      "type": "string",
+      "maxLength": 20000,
+      "minLength": 1,
+      "title": "Prompt",
+      "description": "What the agent should do."
+     },
+     "profile": {
+      "anyOf": [
+       {
+        "type": "string",
+        "enum": [
+         "dev",
+         "sandboxed",
+         "eval"
+        ]
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Profile",
+      "description": "Override the server's configured profile for this run."
+     },
+     "team": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Team",
+      "description": "Name of a team from agents/team.py to run as manager+workers instead of the solo agent, e.g. 'engineering'. Omit or null for a solo agent. See GET /v1/agents for the current roster, grouped by team."
+     },
+     "grants": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/GrantsModel"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Capability packs to attach. Omit for the agent's default powers. See GET /v1/capabilities for what exists and which agents may hold each pack."
+     }
+    },
+    "additionalProperties": false,
+    "type": "object",
+    "required": [
+     "prompt"
+    ],
+    "title": "RunRequest",
+    "description": "Body of `POST /v1/runs`."
+   },
+   "RunResponse": {
+    "properties": {
+     "run_id": {
+      "type": "string",
+      "title": "Run Id"
+     },
+     "profile": {
+      "type": "string",
+      "title": "Profile"
+     },
+     "model": {
+      "type": "string",
+      "title": "Model"
+     },
+     "is_error": {
+      "type": "boolean",
+      "title": "Is Error"
+     },
+     "output": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Output"
+     },
+     "num_turns": {
+      "type": "integer",
+      "title": "Num Turns"
+     },
+     "duration_ms": {
+      "type": "integer",
+      "title": "Duration Ms"
+     },
+     "total_cost_usd": {
+      "type": "number",
+      "title": "Total Cost Usd"
+     },
+     "usage": {
+      "additionalProperties": true,
+      "type": "object",
+      "title": "Usage"
+     },
+     "tools_used": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Tools Used"
+     },
+     "delegated_to": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Delegated To"
+     },
+     "tool_events": {
+      "items": {
+       "$ref": "#/components/schemas/ToolEvent"
+      },
+      "type": "array",
+      "title": "Tool Events"
+     },
+     "summary": {
+      "type": "string",
+      "title": "Summary"
+     },
+     "grants": {
+      "additionalProperties": {
+       "items": {
+        "type": "string"
+       },
+       "type": "array"
+      },
+      "type": "object",
+      "title": "Grants",
+      "description": "Capability packs this run actually held, keyed by scope ('lead', 'team:<agent>', 'agent:<agent>'). Echoed rather than reflected back from the request: a team-scoped pack a worker's ceiling refused does not appear here."
+     },
+     "skipped_grants": {
+      "items": {
+       "$ref": "#/components/schemas/SkippedGrantInfo"
+      },
+      "type": "array",
+      "title": "Skipped Grants",
+      "description": "Team-scoped packs a worker's ceiling declined, with the reason. Empty on almost every run; when it is not, this is the difference between what you asked for and what ran."
+     }
+    },
+    "type": "object",
+    "required": [
+     "run_id",
+     "profile",
+     "model",
+     "is_error",
+     "output",
+     "num_turns",
+     "duration_ms",
+     "total_cost_usd",
+     "usage",
+     "tools_used",
+     "delegated_to",
+     "tool_events",
+     "summary"
+    ],
+    "title": "RunResponse",
+    "description": "Result of a completed run. `is_error=True` is still a 200: the request\nsucceeded, the agent did not. Transport failures get a 5xx problem instead."
+   },
+   "SeedResponse": {
+    "properties": {
+     "written": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Written",
+      "description": "Packs that produced a new revision. Empty is normal."
+     },
+     "unchanged": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Unchanged"
+     }
+    },
+    "type": "object",
+    "required": [
+     "written",
+     "unchanged"
+    ],
+    "title": "SeedResponse"
+   },
+   "SessionCreateRequest": {
+    "properties": {
+     "profile": {
+      "anyOf": [
+       {
+        "type": "string",
+        "enum": [
+         "dev",
+         "sandboxed",
+         "eval"
+        ]
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Profile",
+      "description": "Pin the profile for the whole session. Fixed at open time."
+     },
+     "team": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Team",
+      "description": "Name of a team from agents/team.py to open the session as, instead of the solo agent, e.g. 'engineering'. Omit or null for a solo agent. Fixed at open time -- see MessageRequest."
+     },
+     "grants": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/GrantsModel"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Capability packs to attach. Omit for the agent's default powers. See GET /v1/capabilities for what exists and which agents may hold each pack."
+     }
+    },
+    "additionalProperties": false,
+    "type": "object",
+    "title": "SessionCreateRequest",
+    "description": "Body of `POST /v1/sessions`. Every field is optional: the server's own profile\nand a solo (non-team) agent are the defaults, same as `POST /v1/runs`."
+   },
+   "SessionInfo": {
+    "properties": {
+     "id": {
+      "type": "string",
+      "title": "Id",
+      "description": "Opaque handle. Mint it here; do not construct one."
+     },
+     "profile": {
+      "type": "string",
+      "title": "Profile",
+      "description": "Profile the session connected with. Fixed for its life."
+     },
+     "team": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Team",
+      "description": "Team this session runs as manager+workers, or null for a solo agent."
+     },
+     "status": {
+      "type": "string",
+      "enum": [
+       "idle",
+       "busy"
+      ],
+      "title": "Status",
+      "description": "'busy' while a turn is in flight. A message sent to a busy session is a 409, not a queued turn."
+     },
+     "turns": {
+      "type": "integer",
+      "title": "Turns",
+      "description": "Messages completed in this session so far."
+     },
+     "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "title": "Created At"
+     },
+     "last_active_at": {
+      "type": "string",
+      "format": "date-time",
+      "title": "Last Active At",
+      "description": "When the last turn finished. What the idle TTL is measured from."
+     },
+     "expires_at": {
+      "anyOf": [
+       {
+        "type": "string",
+        "format": "date-time"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "title": "Expires At",
+      "description": "When the server may reap this session for idleness. Null when the TTL is disabled. A floor, not a promise: reaping happens on request, so a session may outlive it on an idle server."
+     }
+    },
+    "type": "object",
+    "required": [
+     "id",
+     "profile",
+     "team",
+     "status",
+     "turns",
+     "created_at",
+     "last_active_at"
+    ],
+    "title": "SessionInfo",
+    "description": "One open session. Deliberately not the conversation itself: the transcript is not\nstored here (each turn is persisted as its own run record, keyed by `run_id`), and\nthe SDK client behind it is not something a client can be handed a view of."
+   },
+   "SessionsResponse": {
+    "properties": {
+     "sessions": {
+      "items": {
+       "$ref": "#/components/schemas/SessionInfo"
+      },
+      "type": "array",
+      "title": "Sessions"
+     },
+     "count": {
+      "type": "integer",
+      "title": "Count",
+      "description": "Length of `sessions`."
+     }
+    },
+    "type": "object",
+    "required": [
+     "sessions",
+     "count"
+    ],
+    "title": "SessionsResponse",
+    "description": "Body of `GET /v1/sessions`. An envelope for the same reason `AgentsResponse` is\none: a bare array cannot grow a field."
+   },
+   "SkippedGrantInfo": {
+    "properties": {
+     "agent": {
+      "type": "string",
+      "title": "Agent"
+     },
+     "capability": {
+      "type": "string",
+      "title": "Capability"
+     },
+     "barred_tools": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "title": "Barred Tools"
+     },
+     "reason": {
+      "type": "string",
+      "title": "Reason"
+     }
+    },
+    "type": "object",
+    "required": [
+     "agent",
+     "capability",
+     "barred_tools",
+     "reason"
+    ],
+    "title": "SkippedGrantInfo",
+    "description": "A team-scoped pack one worker did not receive, and why."
+   },
+   "ToolEvent": {
+    "properties": {
+     "tool": {
+      "type": "string",
+      "title": "Tool"
+     },
+     "phase": {
+      "type": "string",
+      "enum": [
+       "pre",
+       "post",
+       "blocked",
+       "failed"
+      ],
+      "title": "Phase"
+     },
+     "at": {
+      "type": "string",
+      "title": "At"
+     },
+     "detail": {
+      "additionalProperties": true,
+      "type": "object",
+      "title": "Detail"
+     }
+    },
+    "type": "object",
+    "required": [
+     "tool",
+     "phase",
+     "at"
+    ],
+    "title": "ToolEvent",
+    "description": "One entry of the run's tool trace."
+   }
+  },
+  "securitySchemes": {
+   "ApiKey": {
+    "type": "apiKey",
+    "in": "header",
+    "name": "X-API-Key"
+   },
+   "HTTPBearer": {
+    "type": "http",
+    "description": "Same value as X-API-Key.",
+    "scheme": "bearer"
+   },
+   "AdminKey": {
+    "type": "apiKey",
+    "in": "header",
+    "name": "X-Admin-Key"
+   }
+  }
+ },
+ "tags": [
+  {
+   "name": "health",
+   "description": "Liveness and readiness probes. Never authenticated."
+  },
+  {
+   "name": "runs",
+   "description": "Execute agent runs."
+  },
+  {
+   "name": "agents",
+   "description": "Agent discovery: which subagents this server can invoke."
+  },
+  {
+   "name": "capabilities",
+   "description": "Capability packs and standing grants. Reading needs the ordinary API key; changing what agents may do needs a separate admin key, and is disabled unless one is configured."
+  },
+  {
+   "name": "sessions",
+   "description": "Multi-turn conversations. A session holds a live agent context open across requests; close it when you are done, or it is reaped when idle."
+  }
+ ]
+}

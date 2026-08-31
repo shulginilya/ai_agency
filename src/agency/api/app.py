@@ -22,13 +22,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.routing import BaseRoute
 
 from agency.api.deps import (
+    ADMIN_KEY_SCHEME,
     API_KEY_HEADER,
+    API_KEY_SCHEME,
+    BEARER_SCHEME,
     Runner,
     RunSlots,
     make_conversation_factory,
     make_runner,
 )
-from agency.api.errors import ProblemFallbackMiddleware, install_error_handlers
+from agency.api.docs import REFERENCE_PATH, install_reference
+from agency.api.errors import (
+    CONTENT_TYPE as PROBLEM_CONTENT_TYPE,
+)
+from agency.api.errors import (
+    ProblemFallbackMiddleware,
+    install_error_handlers,
+)
 from agency.api.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from agency.api.routers import agents, capabilities, health, runs, sessions
 from agency.api.sessions import ConversationFactory, SessionStore
@@ -39,6 +49,21 @@ from agency.obs.logging import configure_logging, get_logger
 from agency.store.agent_state import AgentStateStore, make_agent_state_store
 
 log = get_logger(__name__)
+
+PROBLEM_REF = "#/components/schemas/Problem"
+
+ADMIN_SECURITY: list[dict[str, list[str]]] = [
+    {API_KEY_SCHEME: [], ADMIN_KEY_SCHEME: []},
+    {BEARER_SCHEME: [], ADMIN_KEY_SCHEME: []},
+]
+"""What an admin route actually demands: an ordinary key **and** an admin key.
+
+FastAPI derives `security` from a route's dependencies as a list of *alternatives*, so
+`require_api_key` + `require_admin_key` documents itself as "either will do" -- which is
+precisely the distinction the second credential exists to make. An object with two keys
+is how OpenAPI spells AND."""
+
+SUMMARY = "Run and converse with the `agency` agent harness over HTTP."
 
 DESCRIPTION = """\
 HTTP surface for the `agency` harness.
@@ -120,6 +145,7 @@ def create_app(
             # know why their PUT 404s.
             capability_admin="enabled" if settings.admin_api_key else "disabled",
             docs=settings.api_docs_enabled,
+            reference=REFERENCE_PATH if settings.api_docs_enabled else None,
         )
         # The one background task this app runs. It has to be a task rather than the
         # lazy reaping the store also does, because the session that needs collecting is
@@ -172,8 +198,10 @@ def create_app(
     app = FastAPI(
         title=settings.api_title,
         version=VERSION,
+        summary=SUMMARY,
         description=DESCRIPTION,
         openapi_tags=TAGS,
+        servers=_servers(settings),
         lifespan=lifespan,
         docs_url="/docs" if docs_on else None,
         redoc_url="/redoc" if docs_on else None,
@@ -207,6 +235,11 @@ def create_app(
     app.include_router(sessions.router, prefix=f"/{API_VERSION}")
     app.include_router(capabilities.router, prefix=f"/{API_VERSION}")
     app.include_router(capabilities.grants_router, prefix=f"/{API_VERSION}")
+
+    _install_openapi(app)
+    # After the routers: the page is only a shell around `/openapi.json`, but keeping the
+    # order means the route list it will describe already exists when this runs.
+    install_reference(app, settings)
 
     # `add_middleware` prepends, so the LAST one added is the outermost and runs first.
     # Added innermost-first below, which reads backwards but puts each layer where it has
@@ -262,6 +295,68 @@ async def _start_agent_state_upkeep(app: FastAPI) -> asyncio.Task[None] | None:
             await store.heartbeat()
 
     return asyncio.create_task(beat(), name="agency.agent-state-heartbeat")
+
+
+def _servers(settings: Settings) -> list[dict[str, Any]] | None:
+    """The base URL callers should use, when it is not the address this process binds.
+
+    Behind a reverse proxy those differ, and the spec's implicit default (`/`, resolved
+    against wherever the document was fetched from) is right for the Swagger UI this app
+    serves and wrong for a client generated from an `openapi.json` saved to disk. `None`
+    when unset, so the default stays in place rather than this asserting a public URL it
+    cannot know.
+    """
+    url = settings.api_public_url.strip().rstrip("/")
+    return [{"url": url, "description": "This deployment."}] if url else None
+
+
+def _install_openapi(app: FastAPI) -> None:
+    """Re-label documented error bodies as `application/problem+json`.
+
+    Every error this API returns is an RFC 9457 document sent with that media type (see
+    `errors.py`), but FastAPI renders a `responses={..., "model": Problem}` entry under
+    `application/json` -- there is no per-response media type to pass. A generated client
+    therefore matches on a content type the server never sends, and a strict one refuses
+    to deserialise the body at all.
+
+    Done as a post-pass over the finished document rather than by hand-writing `content`
+    blocks at each route: hand-written blocks need a literal `$ref`, which drops `Problem`
+    out of `components` the moment the last `model=` reference goes, and silently stops
+    tracking the model. Keyed on the `$ref` so it can only ever touch problem documents.
+
+    Caches into `app.openapi_schema` exactly like FastAPI's own method, so the rewrite
+    runs once per process.
+    """
+    base = app.openapi
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = base()
+        for path_item in schema.get("paths", {}).values():
+            for operation in path_item.values():
+                # `path_item` also holds non-operation keys ("parameters", a list).
+                if not isinstance(operation, dict):
+                    continue
+                for response in operation.get("responses", {}).values():
+                    content = response.get("content")
+                    if not content:
+                        continue
+                    body = content.get("application/json")
+                    if body and body.get("schema", {}).get("$ref") == PROBLEM_REF:
+                        content.pop("application/json")
+                        content[PROBLEM_CONTENT_TYPE] = body
+                # The admin key is never an alternative to the ordinary one. Keyed on
+                # the derived shape rather than a per-route override because
+                # `openapi_extra` *concatenates* lists rather than replacing them, so
+                # a route-level `security` lands after the derived one instead of
+                # replacing it.
+                if any(alt == {ADMIN_KEY_SCHEME: []} for alt in operation.get("security", [])):
+                    operation["security"] = [dict(alt) for alt in ADMIN_SECURITY]
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def _allowed_methods(*routers: APIRouter) -> list[str]:
