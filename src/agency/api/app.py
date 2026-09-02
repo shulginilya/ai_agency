@@ -22,21 +22,48 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.routing import BaseRoute
 
 from agency.api.deps import (
+    ADMIN_KEY_SCHEME,
     API_KEY_HEADER,
+    API_KEY_SCHEME,
+    BEARER_SCHEME,
     Runner,
     RunSlots,
     make_conversation_factory,
     make_runner,
 )
-from agency.api.errors import ProblemFallbackMiddleware, install_error_handlers
+from agency.api.docs import REFERENCE_PATH, install_reference
+from agency.api.errors import (
+    CONTENT_TYPE as PROBLEM_CONTENT_TYPE,
+)
+from agency.api.errors import (
+    ProblemFallbackMiddleware,
+    install_error_handlers,
+)
 from agency.api.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
-from agency.api.routers import agents, health, runs, sessions
+from agency.api.routers import agents, capabilities, health, runs, sessions
 from agency.api.sessions import ConversationFactory, SessionStore
 from agency.api.version import API_VERSION, VERSION
+from agency.capabilities.store import CapabilityStore, make_capability_store
 from agency.config import Settings, get_settings
 from agency.obs.logging import configure_logging, get_logger
+from agency.store.agent_state import AgentStateStore, make_agent_state_store
 
 log = get_logger(__name__)
+
+PROBLEM_REF = "#/components/schemas/Problem"
+
+ADMIN_SECURITY: list[dict[str, list[str]]] = [
+    {API_KEY_SCHEME: [], ADMIN_KEY_SCHEME: []},
+    {BEARER_SCHEME: [], ADMIN_KEY_SCHEME: []},
+]
+"""What an admin route actually demands: an ordinary key **and** an admin key.
+
+FastAPI derives `security` from a route's dependencies as a list of *alternatives*, so
+`require_api_key` + `require_admin_key` documents itself as "either will do" -- which is
+precisely the distinction the second credential exists to make. An object with two keys
+is how OpenAPI spells AND."""
+
+SUMMARY = "Run and converse with the `agency` agent harness over HTTP."
 
 DESCRIPTION = """\
 HTTP surface for the `agency` harness.
@@ -52,6 +79,14 @@ TAGS: list[dict[str, Any]] = [
     {"name": "runs", "description": "Execute agent runs."},
     {"name": "agents", "description": "Agent discovery: which subagents this server can invoke."},
     {
+        "name": "capabilities",
+        "description": (
+            "Capability packs and standing grants. Reading needs the ordinary API key; "
+            "changing what agents may do needs a separate admin key, and is disabled "
+            "unless one is configured."
+        ),
+    },
+    {
         "name": "sessions",
         "description": (
             "Multi-turn conversations. A session holds a live agent context open across "
@@ -66,6 +101,8 @@ def create_app(
     *,
     runner: Runner | None = None,
     conversation_factory: ConversationFactory | None = None,
+    capability_store: CapabilityStore | None = None,
+    agent_state_store: AgentStateStore | None = None,
     project_root: Path | None = None,
 ) -> FastAPI:
     """Build the ASGI app.
@@ -102,7 +139,13 @@ def create_app(
             max_sessions=settings.api_max_sessions,
             session_idle_ttl_s=settings.api_session_idle_ttl_s,
             session_reap_interval_s=store.reap_interval_s,
+            database=settings.database_backend(),
+            # Whether the surface that widens agent powers is reachable at all. Worth a
+            # line at startup: "disabled" is the safe default and someone will want to
+            # know why their PUT 404s.
+            capability_admin="enabled" if settings.admin_api_key else "disabled",
             docs=settings.api_docs_enabled,
+            reference=REFERENCE_PATH if settings.api_docs_enabled else None,
         )
         # The one background task this app runs. It has to be a task rather than the
         # lazy reaping the store also does, because the session that needs collecting is
@@ -110,9 +153,20 @@ def create_app(
         # `SessionStore.reap_forever`. Started here and cancelled below, so it cannot
         # outlive the app or leak on shutdown, which was the original objection to it.
         reaper = asyncio.create_task(store.reap_forever(), name="agency.session-reaper")
+        # Two more background concerns, and only when a database is configured. The sweep
+        # runs once at startup and closes invocations left open by processes that are no
+        # longer alive -- the failure the in-memory registry could not have, because a
+        # dead process took its state with it. The heartbeat is what makes "no longer
+        # alive" a fact rather than a guess, and is why the sweep cannot reap a live
+        # sibling's rows under `uvicorn --workers N`.
+        heartbeat = await _start_agent_state_upkeep(app)
         try:
             yield
         finally:
+            if heartbeat is not None:
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError):
+                    await heartbeat
             # Cancel the reaper first: it and `aclose_all` mutate the same map, and a
             # reap firing mid-shutdown would race the gather for the same session ids.
             reaper.cancel()
@@ -128,6 +182,12 @@ def create_app(
             # including the ones where it would have been the useful number.
             open_sessions = store.count
             await store.aclose_all()
+            # Engines last: the sweep and the stores above may still touch them.
+            # A no-op when no database is configured.
+            with suppress(Exception):
+                from agency.db.engine import dispose_engines
+
+                await dispose_engines()
             log.info(
                 "api.shutdown",
                 in_flight=app.state.slots.in_flight,
@@ -138,8 +198,10 @@ def create_app(
     app = FastAPI(
         title=settings.api_title,
         version=VERSION,
+        summary=SUMMARY,
         description=DESCRIPTION,
         openapi_tags=TAGS,
+        servers=_servers(settings),
         lifespan=lifespan,
         docs_url="/docs" if docs_on else None,
         redoc_url="/redoc" if docs_on else None,
@@ -162,6 +224,8 @@ def create_app(
         limit=settings.api_max_sessions,
         idle_ttl_s=settings.api_session_idle_ttl_s,
     )
+    app.state.capabilities = capability_store or make_capability_store(settings)
+    app.state.agent_state = agent_state_store or make_agent_state_store(settings)
 
     install_error_handlers(app)
 
@@ -169,6 +233,13 @@ def create_app(
     app.include_router(runs.router, prefix=f"/{API_VERSION}")
     app.include_router(agents.router, prefix=f"/{API_VERSION}")
     app.include_router(sessions.router, prefix=f"/{API_VERSION}")
+    app.include_router(capabilities.router, prefix=f"/{API_VERSION}")
+    app.include_router(capabilities.grants_router, prefix=f"/{API_VERSION}")
+
+    _install_openapi(app)
+    # After the routers: the page is only a shell around `/openapi.json`, but keeping the
+    # order means the route list it will describe already exists when this runs.
+    install_reference(app, settings)
 
     # `add_middleware` prepends, so the LAST one added is the outermost and runs first.
     # Added innermost-first below, which reads backwards but puts each layer where it has
@@ -180,11 +251,112 @@ def create_app(
         settings,
         # sessions.router is what puts DELETE in this list -- the exact case the
         # docstring below warns about.
-        _allowed_methods(health.router, runs.router, agents.router, sessions.router),
+        _allowed_methods(
+            health.router,
+            runs.router,
+            agents.router,
+            sessions.router,
+            capabilities.router,
+            capabilities.grants_router,
+        ),
     )
     app.add_middleware(RequestContextMiddleware)
 
     return app
+
+
+async def _start_agent_state_upkeep(app: FastAPI) -> asyncio.Task[None] | None:
+    """Register this instance, sweep the dead, and keep the heartbeat going.
+
+    Returns `None` with no database, where none of it means anything: a single process
+    observing its own workers has no cross-process question to answer.
+
+    Every step is best-effort. A status table that cannot be reached should degrade the
+    roster display, never stop the server from accepting runs.
+    """
+    store = app.state.agent_state
+    register = getattr(store, "register_instance", None)
+    if register is None:
+        return None
+
+    from agency.store.db_agent_state import HEARTBEAT_INTERVAL_S
+
+    try:
+        await register()
+        swept = await store.sweep_dead_instances()
+        log.info("api.agent_state_ready", swept_invocations=swept)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        log.warning("api.agent_state_upkeep_failed", error=str(exc))
+        return None
+
+    async def beat() -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+            await store.heartbeat()
+
+    return asyncio.create_task(beat(), name="agency.agent-state-heartbeat")
+
+
+def _servers(settings: Settings) -> list[dict[str, Any]] | None:
+    """The base URL callers should use, when it is not the address this process binds.
+
+    Behind a reverse proxy those differ, and the spec's implicit default (`/`, resolved
+    against wherever the document was fetched from) is right for the Swagger UI this app
+    serves and wrong for a client generated from an `openapi.json` saved to disk. `None`
+    when unset, so the default stays in place rather than this asserting a public URL it
+    cannot know.
+    """
+    url = settings.api_public_url.strip().rstrip("/")
+    return [{"url": url, "description": "This deployment."}] if url else None
+
+
+def _install_openapi(app: FastAPI) -> None:
+    """Re-label documented error bodies as `application/problem+json`.
+
+    Every error this API returns is an RFC 9457 document sent with that media type (see
+    `errors.py`), but FastAPI renders a `responses={..., "model": Problem}` entry under
+    `application/json` -- there is no per-response media type to pass. A generated client
+    therefore matches on a content type the server never sends, and a strict one refuses
+    to deserialise the body at all.
+
+    Done as a post-pass over the finished document rather than by hand-writing `content`
+    blocks at each route: hand-written blocks need a literal `$ref`, which drops `Problem`
+    out of `components` the moment the last `model=` reference goes, and silently stops
+    tracking the model. Keyed on the `$ref` so it can only ever touch problem documents.
+
+    Caches into `app.openapi_schema` exactly like FastAPI's own method, so the rewrite
+    runs once per process.
+    """
+    base = app.openapi
+
+    def openapi() -> dict[str, Any]:
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = base()
+        for path_item in schema.get("paths", {}).values():
+            for operation in path_item.values():
+                # `path_item` also holds non-operation keys ("parameters", a list).
+                if not isinstance(operation, dict):
+                    continue
+                for response in operation.get("responses", {}).values():
+                    content = response.get("content")
+                    if not content:
+                        continue
+                    body = content.get("application/json")
+                    if body and body.get("schema", {}).get("$ref") == PROBLEM_REF:
+                        content.pop("application/json")
+                        content[PROBLEM_CONTENT_TYPE] = body
+                # The admin key is never an alternative to the ordinary one. Keyed on
+                # the derived shape rather than a per-route override because
+                # `openapi_extra` *concatenates* lists rather than replacing them, so
+                # a route-level `security` lands after the derived one instead of
+                # replacing it.
+                if any(alt == {ADMIN_KEY_SCHEME: []} for alt in operation.get("security", [])):
+                    operation["security"] = [dict(alt) for alt in ADMIN_SECURITY]
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = openapi  # type: ignore[method-assign]
 
 
 def _allowed_methods(*routers: APIRouter) -> list[str]:

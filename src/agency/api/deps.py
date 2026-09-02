@@ -30,19 +30,39 @@ from typing import Annotated, Any, Protocol
 from fastapi import Depends, Request
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
-from agency.api.errors import Overloaded, Unauthorized
+from agency.api.errors import NotFound, Overloaded, Unauthorized
 from agency.api.sessions import Conversation, ConversationFactory, SessionStore
+from agency.capabilities.model import ResolvedGrants
+from agency.capabilities.store import CapabilityStore
 from agency.config import Profile, Settings
 from agency.obs.cost import RunRecord
 from agency.obs.logging import get_logger
+from agency.store.agent_state import AgentStateStore
 
 log = get_logger(__name__)
 
 API_KEY_HEADER = "X-API-Key"
+ADMIN_KEY_HEADER = "X-Admin-Key"
 
 # auto_error=False on both: neither scheme is individually mandatory (either satisfies
 # auth) and we want our own problem+json 401, not FastAPI's default JSON body.
-_api_key_scheme = APIKeyHeader(name=API_KEY_HEADER, auto_error=False)
+#
+# `scheme_name` is not decoration. FastAPI names a security scheme after its *class*, so
+# two `APIKeyHeader`s collapse into one `APIKeyHeader` entry in `components` -- and the
+# survivor was the admin one, which made every authenticated route in the spec (and the
+# Authorize dialog, and the reference page's curl samples) ask for `X-Admin-Key`. These
+# three names are also what `app.ADMIN_SECURITY` refers to, so they are constants rather
+# than literals at the constructor.
+API_KEY_SCHEME = "ApiKey"
+ADMIN_KEY_SCHEME = "AdminKey"
+BEARER_SCHEME = "HTTPBearer"
+
+_api_key_scheme = APIKeyHeader(
+    name=API_KEY_HEADER, scheme_name=API_KEY_SCHEME, auto_error=False
+)
+_admin_key_scheme = APIKeyHeader(
+    name=ADMIN_KEY_HEADER, scheme_name=ADMIN_KEY_SCHEME, auto_error=False
+)
 _bearer_scheme = HTTPBearer(auto_error=False, description="Same value as X-API-Key.")
 
 
@@ -54,7 +74,12 @@ class Runner(Protocol):
     """
 
     async def __call__(
-        self, prompt: str, *, profile: Profile | None = None, team: str | None = None
+        self,
+        prompt: str,
+        *,
+        profile: Profile | None = None,
+        team: str | None = None,
+        grants: ResolvedGrants | None = None,
     ) -> RunRecord: ...
 
 
@@ -67,7 +92,11 @@ def make_runner(settings: Settings, project_root: Path) -> Runner:
     from agency.runner import run_once
 
     async def _run(
-        prompt: str, *, profile: Profile | None = None, team: str | None = None
+        prompt: str,
+        *,
+        profile: Profile | None = None,
+        team: str | None = None,
+        grants: ResolvedGrants | None = None,
     ) -> RunRecord:
         return await run_once(
             prompt,
@@ -75,6 +104,7 @@ def make_runner(settings: Settings, project_root: Path) -> Runner:
             settings=settings,
             project_root=project_root,
             team=team,
+            grants=grants,
         )
 
     return _run
@@ -196,12 +226,15 @@ def make_conversation_factory(settings: Settings, project_root: Path) -> Convers
     """
     from agency.runner import Agent
 
-    async def _open(*, profile: Profile, team: str | None = None) -> Conversation:
+    async def _open(
+        *, profile: Profile, team: str | None = None, grants: ResolvedGrants | None = None
+    ) -> Conversation:
         agent = Agent(
             profile=profile,
             settings=settings,
             project_root=project_root,
             team=team,
+            grants=grants,
         )
         await agent.__aenter__()
         return _AgentConversation(agent)
@@ -289,6 +322,47 @@ def get_sessions(request: Request) -> SessionStore:
     return sessions
 
 
+def get_capabilities(request: Request) -> CapabilityStore:
+    store: CapabilityStore = request.app.state.capabilities
+    return store
+
+
+def get_agent_state(request: Request) -> AgentStateStore:
+    store: AgentStateStore = request.app.state.agent_state
+    return store
+
+
+async def require_admin_key(
+    settings: Annotated[Settings, Depends(get_settings_dep)],
+    api_key: Annotated[str | None, Depends(_admin_key_scheme)] = None,
+) -> None:
+    """Gate for routes that widen what agents may do.
+
+    Deliberately not `require_api_key`. That credential authorises *running* agents;
+    these routes authorise *changing what agents can do*, and a read key leaking is a
+    very different incident from a write key leaking. One boolean credential with no
+    identities is a weak answer to that -- it is a stopgap, and a real actor model is the
+    follow-up -- but two credentials with different blast radii beats one.
+
+    Unset means the mutating routes 404 rather than run open, so the safe configuration
+    is the default one. 404 rather than 401 because an unconfigured admin surface should
+    not advertise that it exists.
+    """
+    if not settings.admin_api_key:
+        raise NotFound(
+            "The capability admin API is disabled. Set AGENCY_ADMIN_API_KEY to enable it."
+        )
+    if api_key and compare_digest(api_key, settings.admin_api_key):
+        return
+    log.warning("api.admin_auth_failed", presented=bool(api_key))
+    raise Unauthorized(f"A valid admin key is required. Send {ADMIN_KEY_HEADER}.")
+
+
+def admin_actor(settings: Settings) -> str:
+    """What lands in `created_by`. A label, not an identity -- see `require_admin_key`."""
+    return "admin-api"
+
+
 async def require_api_key(
     settings: Annotated[Settings, Depends(get_settings_dep)],
     api_key: Annotated[str | None, Depends(_api_key_scheme)] = None,
@@ -314,23 +388,32 @@ async def require_api_key(
 
 
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
+CapabilitiesDep = Annotated[CapabilityStore, Depends(get_capabilities)]
+AgentStateDep = Annotated[AgentStateStore, Depends(get_agent_state)]
 RunnerDep = Annotated[Runner, Depends(get_runner)]
 SlotsDep = Annotated[RunSlots, Depends(get_slots)]
 SessionsDep = Annotated[SessionStore, Depends(get_sessions)]
 
 __all__ = [
+    "ADMIN_KEY_HEADER",
     "API_KEY_HEADER",
+    "AgentStateDep",
+    "CapabilitiesDep",
     "Runner",
     "RunSlots",
     "RunnerDep",
     "SessionsDep",
     "SettingsDep",
     "SlotsDep",
+    "admin_actor",
+    "get_agent_state",
+    "get_capabilities",
     "get_runner",
     "get_sessions",
     "get_settings_dep",
     "get_slots",
     "make_conversation_factory",
     "make_runner",
+    "require_admin_key",
     "require_api_key",
 ]

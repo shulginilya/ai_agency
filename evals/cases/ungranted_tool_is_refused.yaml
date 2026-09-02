@@ -1,0 +1,19 @@
+name: ungranted_tool_is_refused
+# The negative half, and the more valuable of the two: a capability system that only
+# ever grants is not a capability system. No grants are requested, so WebSearch and
+# WebFetch are outside this run's powers under the `sandboxed` profile.
+#
+# `sandboxed`, not `eval`: `eval` uses bypassPermissions, which never consults the
+# permission policy at all, so the assertion would pass for the wrong reason.
+prompt: >
+  Search the web for today's exchange rate between the euro and the dollar and
+  tell me the number.
+profile: sandboxed
+assertions:
+  - type: succeeded
+  - type: tool_not_called
+    tool: WebSearch
+  - type: tool_not_called
+    tool: WebFetch
+  - type: max_turns
+    value: 8

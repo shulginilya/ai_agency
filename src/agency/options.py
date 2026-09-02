@@ -16,6 +16,9 @@ from claude_agent_sdk.types import HookEvent, PermissionMode
 
 from agency.agents.definitions import AGENTS
 from agency.agents.team import get_team
+from agency.capabilities.apply import apply_to_roster
+from agency.capabilities.model import EMPTY as NO_GRANTS
+from agency.capabilities.model import ResolvedGrants
 from agency.config import Profile, Settings, get_settings
 from agency.hooks.audit import (
     make_failure_audit_hook,
@@ -30,7 +33,8 @@ from agency.hooks.delegation import (
 from agency.hooks.guardrails import make_guardrail_hook
 from agency.obs.cost import RunRecord
 from agency.obs.logging import get_logger
-from agency.permissions import can_use_tool
+from agency.permissions import make_can_use_tool
+from agency.store.agent_state import AgentStateStore
 from agency.tools.registry import ALLOWED_CUSTOM_TOOLS, build_tool_server
 
 log = get_logger(__name__)
@@ -71,6 +75,33 @@ SUBAGENT_LIMITS = {
     "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1",
     "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS": "4",
 }
+
+SKILL_PLUGIN_DIR = "capabilities"
+"""Repo-relative directory holding the local plugin that carries granted skills.
+
+Loaded via `ClaudeAgentOptions.plugins`, which the transport turns into `--plugin-dir
+<abs path>`. That path is explicit and independent of both the CLI's cwd and every
+settings file, which is the only reason skills can work here at all:
+
+- `setting_sources=[]` below is deliberate (see the note at the bottom of this function),
+  and the SDK only applies its skills auto-default when that field is `None`. So
+  `options.skills=[...]` with `setting_sources=[]` appends `Skill(name)` allow rules for
+  skills the CLI was never told to discover -- and fails **silently**, with no error and
+  no warning, just a skill the model cannot see.
+- Even setting `setting_sources=["project"]` would not fix it: project-scoped discovery is
+  rooted at the CLI's cwd, and `cwd` here is the *workspace*, not the repo. A
+  `.claude/skills/` at the repo root would still be invisible, and `add_dirs` does not
+  help -- that widens file access, not settings discovery.
+
+Discovery verified against the bundled CLI on 2026-08-30:
+`claude --plugin-dir <abs path> plugin details agency-caps` lists both skills from a cwd
+that is not the repo, with no settings file naming them. What remains unverified is a
+model *invoking* a granted skill mid-run -- see `evals/cases/granted_skill_is_used.yaml`,
+which needs a working credential.
+
+Passed only when a grant actually names a skill, so an ungranted run's baseline --
+including the eval baseline -- is untouched.
+"""
 
 
 def _subprocess_env(settings: Settings) -> dict[str, str]:
@@ -124,12 +155,24 @@ def _load_mcp_servers(root: Path) -> dict[str, Any]:
     return servers
 
 
+def available_mcp_servers(project_root: Path | None = None) -> list[str]:
+    """Names of the MCP servers a run would load.
+
+    Resolution uses this to refuse a capability naming a server the session does not
+    have. A pack may scope a worker to an existing server; it may not introduce one,
+    because that would open a network path from a call site with no review.
+    """
+    return sorted(_load_mcp_servers(project_root or Path.cwd()))
+
+
 def build_options(
     profile: Profile | None = None,
     record: RunRecord | None = None,
     settings: Settings | None = None,
     project_root: Path | None = None,
     team: str | None = None,
+    grants: ResolvedGrants | None = None,
+    agent_state_store: AgentStateStore | None = None,
 ) -> ClaudeAgentOptions:
     """Build the options for a run.
 
@@ -140,15 +183,26 @@ def build_options(
     prompt and adds its workers. `None` (the default) is solo mode. An unknown name
     raises `ValueError` from `get_team` -- caught by the CLI and turned into a 422 by
     the API's request validators, so a typo'd team name never reaches the SDK.
+    `grants` is an already-resolved capability set. It is a *value*, not a request:
+    resolution may hit a database, and this function must stay synchronous, total and
+    free of I/O -- every test in `test_options.py` and `test_team.py` calls it directly,
+    and making it async to `await` a query would drag a database into all of them.
+    `capabilities.store.resolve_for_run` is the async half; see `docs/architecture.md`.
+    `None` and `capabilities.model.EMPTY` are the same thing and produce options
+    identical to a run with no grants at all, which is what keeps the ungranted path
+    exercised by the existing suite rather than becoming a branch nobody covers.
+
     Everything else -- profile, guardrails, budget -- is unchanged, which is the
-    point. Orchestration and policy are orthogonal; a manager in `sandboxed` is still
-    sandboxed, and so is every worker it spawns.
+    point. Orchestration, policy and capability are orthogonal; a manager in `sandboxed`
+    is still sandboxed, so is every worker it spawns, and a grant widens what may be
+    asked for without widening what is auto-approved.
     """
     settings = settings or get_settings()
     profile = profile or settings.profile
     project_root = project_root or Path.cwd()
     workspace = settings.resolved_workspace()
     team_def = get_team(team) if team else None
+    grants = grants or NO_GRANTS
 
     allowed = [*READ_ONLY_TOOLS, *ALLOWED_CUSTOM_TOOLS]
     permission_mode: PermissionMode = "default"
@@ -166,6 +220,42 @@ def build_options(
         permission_mode = "bypassPermissions"  # deterministic: never prompt
         max_turns = min(max_turns, 20)
 
+    # Where a lead grant lands depends on the profile, and the difference is the whole
+    # point of the two being orthogonal. `allowed_tools` means *auto-approve*: under
+    # `dev` and `eval` that is already the posture, so a granted tool joins the list.
+    # Under `sandboxed` it must not -- auto-approving is the one thing that profile
+    # refuses to do -- so the grant goes only into the permission policy below, where the
+    # call is still gated, just no longer denied for not being in a hardcoded set.
+    if grants.lead.tools and permission_mode != "default":
+        for tool in grants.lead.tools:
+            if tool not in allowed:
+                allowed.append(tool)
+
+    # Skills are enabled per session, and only when something actually granted one --
+    # an unconditional plugin dir would move every run's baseline, the eval baseline
+    # included, for no benefit. Absolute path from the project root: a relative one
+    # resolves against `cwd`, which is the workspace scratch directory.
+    #
+    # The union across scopes, not `grants.lead.skills`: both switches below are
+    # session-wide and neither can be scoped to a worker, so reading the lead alone
+    # made an agent-scoped skill grant a silent no-op -- `AgentDefinition.skills`
+    # naming a skill the CLI was never told to discover. See
+    # `ResolvedGrants.granted_skills`.
+    granted_skills = list(grants.granted_skills())
+    plugins: list[dict[str, str]] = []
+    if granted_skills:
+        plugin_path = (project_root / SKILL_PLUGIN_DIR).resolve()
+        plugins.append({"type": "local", "path": str(plugin_path)})
+
+    roster = {**AGENTS, **team_def.workers} if team_def else dict(AGENTS)
+    # Copy, never mutate: `AGENTS` and every team's `workers` are module-level dicts of a
+    # mutable dataclass, so an in-place append would leak this run's grant into the next
+    # request on a server. `apply_to_roster` returns fresh definitions.
+    roster = apply_to_roster(roster, grants)
+
+    system_prompt = team_def.manager_prompt if team_def else SYSTEM_PROMPT
+    system_prompt += grants.lead.prompt_suffix()
+
     # Subagent lifecycle. PostToolUse sees the Agent *call*; only these see which worker
     # actually ran and for how long. Both halves of the start/stop pair come from one
     # factory so they share the start-time map.
@@ -175,10 +265,12 @@ def build_options(
     # would make live agent status quietly depend on whether the caller wanted a tool
     # trace -- two unrelated things, and the symptom would be an agent stuck on `idle`
     # while it is visibly running.
-    start_hook = make_subagent_start_hook(record)
+    start_hook = make_subagent_start_hook(record, agent_state_store)
     hooks: dict[HookEvent, list[HookMatcher]] = {
         "PreToolUse": [HookMatcher(hooks=[make_guardrail_hook(workspace, record)])],
-        "PostToolUseFailure": [HookMatcher(hooks=[make_delegation_failure_hook()])],
+        "PostToolUseFailure": [
+            HookMatcher(hooks=[make_delegation_failure_hook(agent_state_store)])
+        ],
         "SubagentStart": [HookMatcher(hooks=[start_hook])],
         "SubagentStop": [HookMatcher(hooks=[make_subagent_stop_hook(start_hook)])],
     }
@@ -189,18 +281,28 @@ def build_options(
 
     options = ClaudeAgentOptions(
         model=settings.model,
-        system_prompt=team_def.manager_prompt if team_def else SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         cwd=str(workspace),
         add_dirs=[str(project_root)] if profile != "sandboxed" else [],
         allowed_tools=allowed,
         disallowed_tools=ALWAYS_DISALLOWED,
         permission_mode=permission_mode,
-        can_use_tool=can_use_tool if permission_mode != "bypassPermissions" else None,
+        # The policy closes over this run's grants, so a granted tool that falls through
+        # to a prompt is allowed rather than denied for not being in a hardcoded set.
+        can_use_tool=(
+            make_can_use_tool(grants.granted_tools())
+            if permission_mode != "bypassPermissions"
+            else None
+        ),
         hooks=hooks,
-        agents={**AGENTS, **team_def.workers} if team_def else AGENTS,
+        agents=roster,
         mcp_servers=_load_mcp_servers(project_root),
         max_turns=max_turns,
         max_budget_usd=settings.max_budget_usd,
+        # Only set when a grant named a skill. `None` is not "skills off" -- it means the
+        # SDK adds no configuration of its own, which is the pre-existing behaviour.
+        skills=granted_skills or None,
+        plugins=plugins,  # type: ignore[arg-type]
         # Deliberate: do not inherit ambient user/project/local settings. The harness
         # should behave identically on every machine and in CI.
         setting_sources=[],
@@ -214,6 +316,12 @@ def build_options(
         "options.built",
         profile=profile,
         team=team,
+        # A run whose capability set is not in its own log line is a run nobody can
+        # explain afterwards -- including which packs a ceiling silently declined.
+        grants=grants.summary(),
+        granted_tools=sorted(grants.granted_tools()),
+        granted_skills=granted_skills,
+        skipped_grants=[f"{s.subject}:{s.capability}" for s in grants.skipped],
         model=settings.model,
         auth=settings.agent_auth_source(),
         permission_mode=permission_mode,

@@ -1,0 +1,5 @@
+{
+  "name": "agency-caps",
+  "version": "0.1.0",
+  "description": "Skills carried by agency capability packs. Loaded via ClaudeAgentOptions.plugins, never through settings discovery."
+}

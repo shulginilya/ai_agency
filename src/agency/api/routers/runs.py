@@ -22,9 +22,16 @@ from __future__ import annotations
 import anyio
 from fastapi import APIRouter, Depends, status
 
-from agency.api.deps import RunnerDep, SettingsDep, SlotsDep, require_api_key
+from agency.api.deps import (
+    CapabilitiesDep,
+    RunnerDep,
+    SettingsDep,
+    SlotsDep,
+    require_api_key,
+)
 from agency.api.errors import RunTimeout, UpstreamError, raise_for_auth_failure
-from agency.api.schemas import Problem, RunRequest, RunResponse
+from agency.api.schemas import PROBLEM_RESPONSES, Problem, RunRequest, RunResponse
+from agency.capabilities.model import Grants, ResolvedGrants
 from agency.obs.logging import get_logger
 
 log = get_logger(__name__)
@@ -34,13 +41,25 @@ router = APIRouter(
     tags=["runs"],
     dependencies=[Depends(require_api_key)],
     responses={
-        401: {"model": Problem, "description": "Missing or invalid API key"},
-        422: {"model": Problem, "description": "Request failed validation"},
+        **PROBLEM_RESPONSES,
         502: {"model": Problem, "description": "The agent loop failed"},
         503: {"model": Problem, "description": "No run slot available; retry"},
         504: {"model": Problem, "description": "Run exceeded the server timeout"},
     },
 )
+
+
+async def _resolve(body: RunRequest, capabilities: CapabilitiesDep) -> ResolvedGrants:
+    """Standing assignments plus what the caller asked for, pinned to revisions.
+
+    Deferred import of `runner`, matching the rule that nothing under `api/` may import
+    `agency.runner` at module scope -- `deps.make_runner` is the only binding to the real
+    loop, and this keeps that true.
+    """
+    from agency.runner import resolve_grants
+
+    requested = body.grants.to_grants() if body.grants else Grants()
+    return await resolve_grants(capabilities, requested, team=body.team)
 
 
 @router.post(
@@ -55,12 +74,26 @@ async def create_run(
     runner: RunnerDep,
     slots: SlotsDep,
     settings: SettingsDep,
+    capabilities: CapabilitiesDep,
 ) -> RunResponse:
+    # Resolved before a slot is taken, deliberately: an unknown pack or a ceiling
+    # violation must fail before this request occupies one of a small number of run
+    # slots, and long before a subprocess is spawned. `GrantError` subclasses ValueError
+    # and the handler maps it to a 422.
+    grants = await _resolve(body, capabilities)
+
     async with slots.slot():
-        log.info("api.run.start", profile=body.profile or settings.profile, team=body.team)
+        log.info(
+            "api.run.start",
+            profile=body.profile or settings.profile,
+            team=body.team,
+            grants=grants.summary(),
+        )
         try:
             with anyio.fail_after(settings.api_run_timeout_s):
-                record = await runner(body.prompt, profile=body.profile, team=body.team)
+                record = await runner(
+                    body.prompt, profile=body.profile, team=body.team, grants=grants
+                )
         except TimeoutError:
             # The timeout unwinds `Agent.__aexit__`, which tears down the SDK
             # subprocess; without that the process is orphaned and keeps billing after
@@ -92,4 +125,4 @@ async def create_run(
     # An agent that errored is a successful request with is_error=True. Reserve 5xx for
     # "we could not run it", so a client can tell "the model failed" from "we failed".
     log.info("api.run.done", run_id=record.run_id, is_error=record.is_error)
-    return RunResponse.from_record(record)
+    return RunResponse.from_record(record, grants)

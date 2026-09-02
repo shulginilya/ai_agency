@@ -1,0 +1,31 @@
+# The worker half of the grant contract, and the half with a second silent failure in
+# it: a skill granted to a worker reaches the CLI through two *session-wide* switches
+# (--plugin-dir, and the Skill(name) allow rule derived from ClaudeAgentOptions.skills),
+# neither of which can be scoped to one agent. Building them from `grants.lead.skills`
+# alone made this case a no-op that still logged a successful grant -- so it fails here
+# as "the planner never invoked the skill", which is indistinguishable from the model
+# choosing not to. See ResolvedGrants.granted_skills.
+name: granted_skill_reaches_a_worker
+prompt: >
+  Have the scrum-master write up the change in src/agency/capabilities/ as a ticket
+  body someone else could review. Return what it produces.
+profile: eval
+team: engineering
+grants:
+  agents:
+    scrum-master: ["change-to-issue"]
+assertions:
+  - type: succeeded
+  # The manager must actually delegate: it holds the skill too (the switches are
+  # session-wide), so an output-only assertion passes on a manager that did it itself.
+  - type: delegated_to
+    values: ["scrum-master"]
+  - type: tool_called
+    tool: Skill
+  - type: contains_any
+    values: ["Problem", "Design decisions", "Out of scope"]
+  - type: no_blocked_calls
+  - type: max_turns
+    value: 15
+  - type: max_cost_usd
+    value: 0.60

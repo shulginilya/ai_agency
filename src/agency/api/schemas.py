@@ -7,6 +7,7 @@ change). `RunResponse.from_record` is the one place the two are mapped.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Annotated, Any, Literal
@@ -14,15 +15,51 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agency.api.sessions import Session
+from agency.capabilities.model import Capability, Grants, ResolvedGrants
 from agency.config import Profile
 from agency.hooks.delegation import delegations
-from agency.obs.agent_state import REGISTRY, AgentState
+from agency.obs.agent_state import AgentState
 from agency.obs.cost import RunRecord
 
 if TYPE_CHECKING:
     from claude_agent_sdk import AgentDefinition
 
 Prompt = Annotated[str, Field(min_length=1, max_length=20_000)]
+
+
+class GrantsModel(BaseModel):
+    """Capability packs to attach to this run, by scope.
+
+    Names only. A free-form tool list here would be simpler and strictly worse: it moves
+    the security decision from a reviewed registry to the call site, it cannot carry the
+    prompt note that makes a granted tool actually get used, and it makes
+    `GET /v1/capabilities` meaningless.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    lead: list[str] = Field(
+        default_factory=list,
+        description="Packs for the main thread -- the manager in team mode, else the agent.",
+    )
+    team: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Packs for every worker of the selected team. A worker whose ceiling forbids "
+            "a pack is skipped rather than failing the run; see `skipped_grants` on the "
+            "response."
+        ),
+    )
+    agents: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Packs for one named agent. Unlike `team`, a ceiling violation here is a 422 "
+            "-- you named the agent, so a silent drop would hide your mistake."
+        ),
+    )
+
+    def to_grants(self) -> Grants:
+        return Grants.parse(self.model_dump())
 
 
 class RunRequest(BaseModel):
@@ -63,6 +100,29 @@ class RunRequest(BaseModel):
             raise ValueError(f"unknown team {value!r}. known teams: {known}")
         return value
 
+    grants: GrantsModel | None = Field(
+        default=None,
+        description=(
+            "Capability packs to attach. Omit for the agent's default powers. See "
+            "GET /v1/capabilities for what exists and which agents may hold each pack."
+        ),
+    )
+
+    @field_validator("grants")
+    @classmethod
+    def _validate_grants(cls, value: GrantsModel | None) -> GrantsModel | None:
+        """Reject a malformed grant request at the edge.
+
+        Only the shape and the scope names are checked here. Whether a pack *exists* and
+        whether a *ceiling* allows it both depend on the registry and the team, which the
+        resolver knows and a field validator does not -- those are 422s raised later,
+        from the same `GrantError` class, so the caller sees one vocabulary either way.
+        """
+        if value is None:
+            return value
+        value.to_grants()  # raises GrantError (a ValueError) -> 422
+        return value
+
 
 class ToolEvent(BaseModel):
     """One entry of the run's tool trace."""
@@ -71,6 +131,15 @@ class ToolEvent(BaseModel):
     phase: Literal["pre", "post", "blocked", "failed"]
     at: str
     detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class SkippedGrantInfo(BaseModel):
+    """A team-scoped pack one worker did not receive, and why."""
+
+    agent: str
+    capability: str
+    barred_tools: list[str]
+    reason: str
 
 
 class RunResponse(BaseModel):
@@ -90,9 +159,25 @@ class RunResponse(BaseModel):
     delegated_to: list[str]
     tool_events: list[ToolEvent]
     summary: str
+    grants: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Capability packs this run actually held, keyed by scope ('lead', "
+            "'team:<agent>', 'agent:<agent>'). Echoed rather than reflected back from the "
+            "request: a team-scoped pack a worker's ceiling refused does not appear here."
+        ),
+    )
+    skipped_grants: list[SkippedGrantInfo] = Field(
+        default_factory=list,
+        description=(
+            "Team-scoped packs a worker's ceiling declined, with the reason. Empty on "
+            "almost every run; when it is not, this is the difference between what you "
+            "asked for and what ran."
+        ),
+    )
 
     @classmethod
-    def from_record(cls, record: RunRecord) -> RunResponse:
+    def from_record(cls, record: RunRecord, grants: ResolvedGrants | None = None) -> RunResponse:
         return cls(
             run_id=record.run_id,
             profile=record.profile,
@@ -110,6 +195,16 @@ class RunResponse(BaseModel):
                 for c in record.tool_calls
             ],
             summary=record.summary(),
+            grants=grants.summary() if grants else {},
+            skipped_grants=[
+                SkippedGrantInfo(
+                    agent=item.subject,
+                    capability=item.capability,
+                    barred_tools=list(item.barred_tools),
+                    reason=item.reason,
+                )
+                for item in (grants.skipped if grants else ())
+            ],
         )
 
 
@@ -142,6 +237,29 @@ class SessionCreateRequest(BaseModel):
         if value not in TEAMS:
             known = ", ".join(sorted(TEAMS))
             raise ValueError(f"unknown team {value!r}. known teams: {known}")
+        return value
+
+    grants: GrantsModel | None = Field(
+        default=None,
+        description=(
+            "Capability packs to attach. Omit for the agent's default powers. See "
+            "GET /v1/capabilities for what exists and which agents may hold each pack."
+        ),
+    )
+
+    @field_validator("grants")
+    @classmethod
+    def _validate_grants(cls, value: GrantsModel | None) -> GrantsModel | None:
+        """Reject a malformed grant request at the edge.
+
+        Only the shape and the scope names are checked here. Whether a pack *exists* and
+        whether a *ceiling* allows it both depend on the registry and the team, which the
+        resolver knows and a field validator does not -- those are 422s raised later,
+        from the same `GrantError` class, so the caller sees one vocabulary either way.
+        """
+        if value is None:
+            return value
+        value.to_grants()  # raises GrantError (a ValueError) -> 422
         return value
 
 
@@ -235,11 +353,13 @@ class MessageResponse(BaseModel):
     run: RunResponse
 
     @classmethod
-    def from_record(cls, session: Session, record: RunRecord) -> MessageResponse:
+    def from_record(
+        cls, session: Session, record: RunRecord, grants: ResolvedGrants | None = None
+    ) -> MessageResponse:
         return cls(
             session_id=session.id,
             turn=session.turns,
-            run=RunResponse.from_record(record),
+            run=RunResponse.from_record(record, grants),
         )
 
 
@@ -322,6 +442,24 @@ def _roster_entries() -> list[tuple[str, AgentDefinition, Availability, str | No
     return entries
 
 
+def _partition_by_ceiling(
+    agent_name: str, registry: Mapping[str, Capability]
+) -> tuple[list[str], list[str]]:
+    """Split the registry into what this agent may and may not hold.
+
+    Deferred import for the same reason as `_roster_entries`: keeps this module free of
+    anything heavy at import time. `barred` is published deliberately -- a ceiling nobody
+    can see before they hit it reads as an arbitrary refusal.
+    """
+    from agency.capabilities.resolve import barred_tools
+
+    grantable: list[str] = []
+    barred: list[str] = []
+    for name in sorted(registry):
+        (barred if barred_tools(agent_name, registry[name]) else grantable).append(name)
+    return grantable, barred
+
+
 def known_agent_names() -> list[str]:
     """Every invocable agent name, in response order. Used to make a 404 actionable."""
     return [name for name, _definition, _availability, _team in _roster_entries()]
@@ -379,6 +517,21 @@ class AgentInfo(BaseModel):
             "agent. Pass this as `team` on POST /v1/runs or POST /v1/sessions to reach it."
         ),
     )
+    grantable: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Capability packs this agent may hold. Pass one under `grants.agents` on a "
+            "run or session request."
+        ),
+    )
+    barred: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Packs this agent may never hold, because a ceiling forbids a tool they "
+            "contain. Named explicitly so a refusal is discoverable before it happens "
+            "rather than arriving as an apparently arbitrary 422."
+        ),
+    )
     updated_at: datetime = Field(
         description=(
             "UTC time this agent entered its current status. Never null: an agent that "
@@ -401,6 +554,7 @@ class AgentInfo(BaseModel):
         availability: Availability,
         team: str | None,
         state: AgentState,
+        registry: Mapping[str, Capability] | None = None,
     ) -> AgentInfo:
         # Two sources, joined here: `definition` is static config, `state` is live and
         # comes from the hook stream. Keeping the join in one place is what stops a
@@ -409,6 +563,7 @@ class AgentInfo(BaseModel):
         # camelCase on the way in (AgentDefinition mirrors the TS SDK wire format),
         # snake_case on the way out -- the rest of this API is snake_case and the SDK's
         # naming should not leak into a public contract.
+        grantable, barred = _partition_by_ceiling(name, registry or {})
         return cls(
             id=name,
             name=name,
@@ -419,12 +574,20 @@ class AgentInfo(BaseModel):
             max_turns=definition.maxTurns,
             availability=availability,
             team=team,
+            grantable=grantable,
+            barred=barred,
             updated_at=state.updated_at,
             invocations=state.invocations,
         )
 
     @classmethod
-    def from_name(cls, name: str) -> AgentInfo | None:
+    def from_name(
+        cls,
+        name: str,
+        states: Mapping[str, AgentState],
+        unseen: AgentState,
+        registry: Mapping[str, Capability] | None = None,
+    ) -> AgentInfo | None:
         """Look one agent up by `id`. `None` when there is no such agent -- the route
         turns that into a 404, so this stays free of HTTP concerns and is usable from
         the CLI or a future websocket without dragging FastAPI in.
@@ -436,10 +599,13 @@ class AgentInfo(BaseModel):
         for entry_name, definition, availability, team in _roster_entries():
             if entry_name != name:
                 continue
-            # Snapshot only once we know we are returning something. Same source as the
-            # list endpoint, so the two cannot report different statuses for one agent.
-            state = REGISTRY.snapshot().get(name, REGISTRY.default_state())
-            return cls.from_definition(entry_name, definition, availability, team, state)
+            # State is an argument rather than a module read: it now comes from an
+            # `AgentStateStore`, which may be the process registry or a shared table, and
+            # reading it is async. Passing it in keeps this classmethod synchronous and
+            # keeps the two routes reading one snapshot each.
+            return cls.from_definition(
+                entry_name, definition, availability, team, states.get(name, unseen), registry
+            )
         return None
 
 
@@ -460,23 +626,27 @@ class AgentsResponse(BaseModel):
     )
 
     @classmethod
-    def from_rosters(cls) -> AgentsResponse:
+    def from_rosters(
+        cls,
+        states: Mapping[str, AgentState],
+        unseen: AgentState,
+        registry: Mapping[str, Capability] | None = None,
+    ) -> AgentsResponse:
         """Join the live rosters with live state, so neither half can drift.
 
         Roster reading (and its deferred SDK import) lives in `_roster_entries()`, which
         the single-agent route shares.
         """
-        # One snapshot for the whole response, not a lookup per agent: two agents in the
-        # same body should describe the same instant, or a client watching a fan-out
-        # sees a roster that never actually existed.
-        states = REGISTRY.snapshot()
-        # `default_state()`, not `AgentState()`: the bare default stamps `updated_at`
-        # with the current time, so an agent that has never run would report a fresh
-        # timestamp on every poll and look like it had just done something.
-        unseen = REGISTRY.default_state()
+        # One snapshot for the whole response, taken by the caller, not a lookup per
+        # agent: two agents in the same body should describe the same instant, or a
+        # client watching a fan-out sees a roster that never actually existed.
+        #
+        # `unseen` comes from the store rather than `AgentState()`: the bare default
+        # stamps `updated_at` with the current time, so an agent that has never run would
+        # report a fresh timestamp on every poll and look like it just did something.
         agents = [
             AgentInfo.from_definition(
-                name, definition, availability, team, states.get(name, unseen)
+                name, definition, availability, team, states.get(name, unseen), registry
             )
             for name, definition, availability, team in _roster_entries()
         ]
@@ -509,3 +679,24 @@ class Problem(BaseModel):
     detail: str
     instance: str | None = None
     request_id: str | None = None
+
+
+PROBLEM_RESPONSES: dict[int | str, dict[str, Any]] = {
+    401: {"model": Problem, "description": "Missing or invalid API key"},
+    422: {"model": Problem, "description": "Request failed validation"},
+    500: {"model": Problem, "description": "Unexpected server error"},
+}
+"""The failures every `/v1` route can produce, spread over each router's `responses`.
+
+Shared rather than repeated per router for one reason that is not tidiness: **declaring
+a 422 is what stops FastAPI documenting its own `HTTPValidationError`.** For any route
+with a body or a path parameter, FastAPI appends that schema unless a 422 is already
+declared -- and this API never sends it. `errors.py` turns a `RequestValidationError`
+into a problem document like everything else, so a client generated from an
+undeclared-422 spec branches on a body shape that never arrives. Same argument for 500:
+`ProblemFallbackMiddleware` guarantees the shape, so leaving it undocumented is the
+spec lying by omission.
+
+The media type is corrected in one place, `app._install_openapi` -- FastAPI renders a
+`model` under `application/json`, and these go out as `application/problem+json`.
+"""

@@ -96,6 +96,40 @@ class Settings(BaseSettings):
         description="Point the CLI at a gateway or proxy. Blank => the public API.",
     )
 
+    # --- Persistence ------------------------------------------------------------------
+    # Unset => no database. That is a supported mode, not a degraded one: `agency run`,
+    # `agency repl` and the eval suite work with no database driver installed at all, and
+    # every consumer has a defined no-DB behaviour (seed capabilities, file-backed run
+    # records, unknown agent status). Set => capability packs, run history and live agent
+    # state come from the database instead.
+    #
+    # SecretStr because a DSN carries a password: `agency doctor` prints these settings,
+    # and the credential fields above are already redacted there. A plaintext DSN in that
+    # panel would be a regression, not a convenience.
+    database_url: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Async SQLAlchemy DSN, e.g. sqlite+aiosqlite:///agency.db or "
+            "postgresql+asyncpg://user:pw@host/db. Blank => no database."
+        ),
+    )
+
+    # How long a resolved capability registry may be reused before it is re-read. Every
+    # run otherwise pays several queries before the model is even called. Cross-worker
+    # invalidation is this TTL and nothing cleverer -- LISTEN/NOTIFY is Postgres-only and
+    # would put a backend-specific mechanism on the correctness path. Safe because a run
+    # pins revision ids at resolve time, so a stale cache means "the pack as of N seconds
+    # ago", never "a pack that never existed". 0 disables caching.
+    capability_cache_ttl_s: float = 30.0
+
+    # Grants are a widening of what agents may do, so the routes that edit them are not
+    # the routes that run them. Unset => every mutating capability route 404s, which
+    # makes the safe configuration the default one. This is a stopgap: `api_key` is a
+    # single boolean credential with no identities, and a real actor model is the
+    # follow-up. `created_by` on each revision records the key's label so the audit trail
+    # names something in the meantime.
+    admin_api_key: str | None = None
+
     # Safety rails. max_budget_usd is enforced by the SDK itself, not by us.
     max_turns: int = 40
     max_budget_usd: float = 2.00
@@ -166,6 +200,18 @@ class Settings(BaseSettings):
     # Swagger/ReDoc/openapi.json. Turn off in production.
     api_docs_enabled: bool = True
 
+    # The base URL callers actually reach this API on, when it is not what the process
+    # binds to -- i.e. behind a reverse proxy. Written into the OpenAPI `servers` list,
+    # which is what a generated client and a saved `openapi.json` resolve paths against.
+    # Empty leaves the document relative, which is correct for the docs page this app
+    # serves itself.
+    api_public_url: str = ""
+
+    # Where `/reference` loads the Scalar bundle from. Empty => the pinned CDN URL in
+    # `api/docs.py`. Point it at a self-hosted copy of the same file for a deployment
+    # with no egress, which is the one case where the docs page is otherwise blank.
+    api_docs_js_url: str = ""
+
     def agent_auth_env(self) -> dict[str, str]:
         """Credentials for the SDK subprocess, as environment variables.
 
@@ -227,6 +273,23 @@ class Settings(BaseSettings):
 
     def cors_enabled(self) -> bool:
         return bool(self.cors_origins() or self.cors_origin_regex())
+
+    def resolved_database_url(self) -> str | None:
+        """The DSN as a plain string, or None when persistence is off.
+
+        Blank and whitespace-only normalise to None for the same reason
+        `cors_origin_regex` does: an empty env var must mean "unset", not an unusable
+        empty DSN that fails at engine construction with a parse error.
+        """
+        url = (self.database_url.get_secret_value() if self.database_url else "").strip()
+        return url or None
+
+    def database_backend(self) -> str:
+        """`sqlite`, `postgresql`, or `none`. For doctor and the readiness check."""
+        url = self.resolved_database_url()
+        if url is None:
+            return "none"
+        return "sqlite" if url.startswith("sqlite") else "postgresql"
 
     def resolved_workspace(self) -> Path:
         path = self.workspace_dir.resolve()
