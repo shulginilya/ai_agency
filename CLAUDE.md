@@ -17,7 +17,12 @@ agent harnesses become unreproducible.
 - `runner.py`   — `ClaudeSDKClient` session loop, message dispatch, run records
 - `cli.py`      — typer entrypoint (`agency run`, `agency repl`)
 - `tools/`      — `@tool` functions assembled into an in-process SDK MCP server
-- `agents/`     — `AgentDefinition` subagents
+- `agents/`     — `AgentDefinition` subagents. `team.roster_entries()` is the one
+                  traversal of `AGENTS` + every team's `workers`; `GET /v1/agents`
+                  and `agents/export.py` both read it rather than walking their own
+- `agents/export.py` — one-way dump of the roster to Claude Code subagent markdown.
+                  Frontmatter is built by walking `dataclasses.fields()`, never from
+                  a list of fields — a list goes stale the day the SDK adds one
 - `hooks/`      — `PreToolUse` guardrails, `PostToolUse` audit trace
 - `permissions.py` — `can_use_tool` callback (the prompt fallback)
 - `obs/`        — structlog setup + cost accounting
@@ -162,6 +167,11 @@ through `/v1/capabilities`), run history, and live agent state. Each is a Protoc
   that calls the underlying function directly (no SDK loop).
 - Any behaviour change should come with an eval case in `evals/cases/`. Eyeballing
   output is not a regression test.
+- The markdown export is one-way. `agents/definitions.py` and `agents/team.py` stay
+  the source of truth; `exports/` is a gitignored build artefact and nothing reads a
+  generated file back. Edit the Python and re-run, never the output. `--copy-to DIR`
+  mirrors the same tree into a directory we do not own, so it is additive and never
+  prunes — only `--out` is regenerated in place.
 - `setting_sources=[]` is deliberate: the agent must not inherit ambient user or project
   settings. If you need project settings, change it in `options.py` and say why.
 
@@ -175,6 +185,8 @@ add new commands to `tasks.py`, not to the Makefile, or the two will drift.
     python tasks.py repl        # interactive session
     python tasks.py team "..."  # manager + workers (--team NAME to pick a team)
     python tasks.py teams        # list available teams and their workers
+    python tasks.py export-agents  # write the roster to exports/ as markdown
+    #   --copy-to DIR              # also mirror the tree into DIR (additive, never deletes)
     python tasks.py serve       # HTTP API on AGENCY_API_HOST:AGENCY_API_PORT
     python tasks.py doctor      # print resolved config
     python tasks.py check       # lint + typecheck + test

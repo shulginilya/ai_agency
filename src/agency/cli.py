@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+from agency.agents.export import copy_export, export_roster
 from agency.agents.team import TEAMS, get_team
 from agency.capabilities.model import Capability, GrantError, Grants
 from agency.capabilities.store import CapabilityStore, make_capability_store
@@ -519,6 +520,60 @@ def teams() -> None:
         roster = ", ".join(sorted(definition.workers)) or "[dim]none[/dim]"
         label = f"team: {name}" + ("  [dim](default)[/dim]" if name == default else "")
         console.print(Panel(f"workers: {roster}", title=label, expand=False))
+
+
+@app.command()
+def export_agents(
+    out: Annotated[
+        Path,
+        typer.Option(
+            "--out",
+            help="Directory to write into. Regenerated in place; stale files are removed.",
+        ),
+    ] = Path("exports"),
+    copy_to: Annotated[
+        Path | None,
+        typer.Option(
+            "--copy-to",
+            help=(
+                "Also copy the generated tree into this directory, creating it if needed. "
+                "Additive: existing files of the same name are overwritten, nothing else "
+                "is removed."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Write every agent in the roster to a markdown file under OUT.
+
+    One-way. The Python definitions stay the source of truth and nothing reads these files
+    back, so edit `agents/definitions.py` or `agents/team.py` and re-run rather than
+    editing the output. `OUT/agents/` is the part shaped for `.claude/agents/`; the
+    manager prompts sit beside it, deliberately outside that directory.
+
+    `--copy-to DIR` mirrors the same tree into a second place -- another repo, a plugin,
+    somewhere synced -- so a consumer does not go a roster behind. OUT is still generated
+    and pruned as usual; the copy is additive and never deletes, because that directory
+    may hold files this exporter did not write.
+    """
+    written, removed = export_roster(out)
+    listing = "\n".join(str(path) for path in written)
+    console.print(Panel(listing, title=f"wrote {len(written)} files", expand=False))
+    for path in removed:
+        console.print(f"[dim]removed stale {path}[/dim]")
+
+    if copy_to is not None:
+        try:
+            copied = copy_export(written, out, copy_to)
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]could not copy to {copy_to}:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        console.print(
+            Panel(
+                "\n".join(str(path) for path in copied),
+                title=f"copied {len(copied)} files to {copy_to}",
+                expand=False,
+            )
+        )
 
 
 if __name__ == "__main__":

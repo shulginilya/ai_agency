@@ -98,6 +98,11 @@ def teams(rest: Sequence[str]) -> None:
     run("agency", "teams", *rest)
 
 
+def export_agents(rest: Sequence[str]) -> None:
+    """Export the roster to markdown.  task export-agents [--out DIR] [--copy-to DIR]"""
+    run("agency", "export-agents", *rest)
+
+
 def capabilities(rest: Sequence[str]) -> None:
     """List capability packs.  task capabilities [--seed] """
     run("agency", "capabilities", *rest)
@@ -186,6 +191,7 @@ TASKS: dict[str, Callable[[Sequence[str]], None]] = {
     "repl": repl,
     "team": team,
     "teams": teams,
+    "export-agents": export_agents,
     "capabilities": capabilities,
     "migrate": migrate,
     "serve": serve,

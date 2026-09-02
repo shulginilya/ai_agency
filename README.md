@@ -72,6 +72,7 @@ commands to `tasks.py`, never to both.
 | `repl` | Interactive session, context retained across turns |
 | `team "…"` | Talk to a manager agent, which delegates to its team's workers (`--team NAME`) |
 | `teams` | List available teams and their workers |
+| `export-agents` | Write the roster to `exports/` as Claude Code subagent markdown (`--out DIR`, `--copy-to DIR` to mirror it elsewhere) |
 | `serve` | Serve the HTTP API (`--port`, `--reload`) |
 | `doctor` | Print resolved config, workspace path, MCP status |
 | `lint` / `fmt` | ruff check / ruff format + autofix |
