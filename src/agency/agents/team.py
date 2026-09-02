@@ -24,6 +24,7 @@ snake_case. Yes, in the same file. Yes, it is confusing.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from claude_agent_sdk import AgentDefinition
 
@@ -334,6 +335,34 @@ def roster_names(team: str | None) -> list[str]:
     if team:
         names |= set(get_team(team).workers)
     return sorted(names)
+
+
+Availability = Literal["always", "team"]
+"""Whether an agent is invocable on every run, or only when a team is selected."""
+
+
+def roster_entries() -> list[tuple[str, AgentDefinition, Availability, str | None]]:
+    """The full roster, flattened and ordered: (name, definition, availability, team).
+
+    The single traversal of `AGENTS` + every team's `workers`. `GET /v1/agents` reads it,
+    and so does `agents/export.py` -- two independent walks would eventually disagree, and
+    the disagreement is invisible until a client asks for an agent one of them omitted.
+
+    Sorted within each roster so callers that render or write files get a stable order:
+    an export that reshuffled on every run would produce a diff with no change in it.
+
+    The fourth element is the owning team name, or `None` for an always-available agent.
+    Worker names must stay unique across `AGENTS` and every team in `TEAMS` --
+    `tests/test_team.py` pins that -- because this list is built by concatenation and a
+    repeated name makes a by-name lookup silently return whichever entry came first.
+    """
+    entries: list[tuple[str, AgentDefinition, Availability, str | None]] = [
+        (name, AGENTS[name], "always", None) for name in sorted(AGENTS)
+    ]
+    for team_name in sorted(TEAMS):
+        workers = TEAMS[team_name].workers
+        entries += [(name, workers[name], "team", team_name) for name in sorted(workers)]
+    return entries
 
 
 def get_team(name: str) -> TeamDefinition:

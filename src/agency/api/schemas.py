@@ -412,34 +412,20 @@ class AgentStatus(str, Enum):
 
 
 def _roster_entries() -> list[tuple[str, AgentDefinition, Availability, str | None]]:
-    """The full roster, flattened and ordered, in one place.
+    """The full roster, flattened and ordered, from the one place that walks it.
 
     Both the collection and the single-agent lookup read this, so an agent that shows up
-    in `GET /v1/agents` cannot 404 on `GET /v1/agents/{id}` -- two independent walks of
-    the rosters would eventually disagree, and that disagreement is invisible in tests
-    that only exercise one of them.
+    in `GET /v1/agents` cannot 404 on `GET /v1/agents/{id}`. The traversal itself lives in
+    `agents/team.py` beside the rosters, because `agents/export.py` needs the same list
+    and two independent walks would eventually disagree.
 
-    The fourth element is the owning team name, or `None` for an always-available
-    agent. Worker names must stay unique across `AGENTS` and every team in `TEAMS` --
-    `tests/test_team.py` pins that -- because this list is built by concatenation and a
-    repeated name would make `from_name` silently return whichever entry came first.
-
-    The rosters are imported here, not at module scope: `agency.agents.*` pulls in the
-    SDK, and `agency.api` stays importable without it (`--help`, OpenAPI generation).
-    Same reason `deps.make_runner` defers its import.
+    Imported here, not at module scope: `agency.agents.*` pulls in the SDK, and
+    `agency.api` stays importable without it (`--help`, OpenAPI generation). Same reason
+    `deps.make_runner` defers its import.
     """
-    from agency.agents.definitions import AGENTS
-    from agency.agents.team import TEAMS
+    from agency.agents.team import roster_entries
 
-    entries: list[tuple[str, AgentDefinition, Availability, str | None]] = [
-        (name, AGENTS[name], "always", None) for name in sorted(AGENTS)
-    ]
-    for team_name in sorted(TEAMS):
-        workers = TEAMS[team_name].workers
-        entries += [
-            (name, workers[name], "team", team_name) for name in sorted(workers)
-        ]
-    return entries
+    return roster_entries()
 
 
 def _partition_by_ceiling(

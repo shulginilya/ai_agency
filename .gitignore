@@ -15,3 +15,5 @@ evals/reports/*
 !evals/reports/.gitkeep
 workspace/*
 !workspace/.gitkeep
+exports/*
+!exports/.gitkeep

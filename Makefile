@@ -2,7 +2,7 @@
 # identically. All logic lives in tasks.py -- keep it that way.
 PY ?= python3
 
-.PHONY: install run repl team teams serve doctor lint fmt typecheck test eval check docker-build docker-run clean
+.PHONY: install run repl team teams export-agents serve doctor lint fmt typecheck test eval check docker-build docker-run clean
 
 install:
 	$(PY) tasks.py install
@@ -18,6 +18,9 @@ team:
 
 teams:
 	$(PY) tasks.py teams
+
+export-agents:
+	$(PY) tasks.py export-agents $(ARGS)
 
 serve:
 	$(PY) tasks.py serve $(ARGS)
